@@ -49,12 +49,24 @@ export class InferenceService {
 
         const inferEnd = performance.now();
 
-        // Stub: 10 valid bags of expected count
-        const results = Array(10).fill(0).map(() => ({
-            boxCount: expectedUniformCount,
-            confidenceAverage: 0.98,
-            passedExpectedCount: true
-        }));
+        // Stub: 10 valid bags of expected count, each with fake bounding boxes
+        const results = Array(10).fill(0).map((_, bagIdx) => {
+            const boxes = Array(expectedUniformCount).fill(0).map((_, pillIdx) => ({
+                // Simulate pills spread inside each bag region
+                x: (bagIdx * 0.1) + 0.02 + (pillIdx % 3) * 0.025 + Math.random() * 0.01,
+                y: 0.55 + (Math.floor(pillIdx / 3)) * 0.08 + Math.random() * 0.03,
+                w: 0.018 + Math.random() * 0.005,
+                h: 0.04 + Math.random() * 0.01,
+                confidence: 0.92 + Math.random() * 0.07,
+                label: ['pill', 'capsule', 'tablet'][Math.floor(Math.random() * 3)]
+            }));
+            return {
+                boxCount: expectedUniformCount,
+                confidenceAverage: 0.98,
+                passedExpectedCount: true,
+                boxes
+            };
+        });
 
         // If uniform rule is enabled, assume all pass for Track A true
         const overallPass = results.every(r => r.passedExpectedCount);

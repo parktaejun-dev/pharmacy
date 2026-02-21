@@ -101,7 +101,7 @@ function App() {
                 <div className="quality-pill">{getQualityKorean()}</div>
               )}
               <button className="btn scan-btn" onClick={executeScan}>
-                📸 촬영 및 검수
+                📸<br />촬영
               </button>
             </div>
           </div>
