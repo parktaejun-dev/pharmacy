@@ -62,18 +62,9 @@ function App() {
     }
   }, [appState]);
 
-  const handleStartScan = () => {
-    // MVP: skip calibration, go straight to scan-ready
-    setAppState('READY_TO_SCAN');
-  };
+
 
   const executeTrackAScan = async () => {
-    if (!quality.isStable) {
-      alert(quality.rejectionReason || '카메라를 안정시켜주세요.');
-      setAppState('RESCAN');
-      return;
-    }
-
     setAppState('SCANNING');
     const startOverall = performance.now();
     const captureMs = 12.4;
@@ -119,53 +110,22 @@ function App() {
         return <DeviceHealthCheck />;
 
       case 'CAMERA_READY':
-        return (
-          <div className="viewport-wrapper">
-            <CameraView isActive={true} onFrameReady={handleFrameReady} onQualityUpdate={setQuality} />
-            <div className="camera-overlay">
-              {!quality.isStable && (
-                <div className="quality-pill" style={{ color: 'var(--accent-red)' }}>
-                  {getQualityKorean()}
-                </div>
-              )}
-              <button
-                className="btn"
-                onClick={handleStartScan}
-                style={{
-                  background: quality.isStable ? 'var(--accent-blue)' : '#555',
-                  padding: '10px 28px',
-                  fontSize: '1rem'
-                }}
-              >
-                {quality.isStable ? '📸 스캔 시작' : '안정화 중...'}
-              </button>
-            </div>
-          </div>
-        );
-
       case 'READY_TO_SCAN':
       case 'RESCAN':
         return (
           <div className="viewport-wrapper">
             <CameraView isActive={true} onFrameReady={handleFrameReady} onQualityUpdate={setQuality} />
             <div className="camera-overlay">
-              {!quality.isStable && (
-                <div className="quality-pill" style={{ color: 'var(--accent-red)' }}>
+              {!quality.isStable && getQualityKorean() && (
+                <div className="quality-pill">
                   {getQualityKorean()}
                 </div>
               )}
               <button
-                className="btn"
+                className="btn scan-btn"
                 onClick={executeTrackAScan}
-                disabled={!quality.isStable}
-                style={{
-                  background: quality.isStable ? 'var(--accent-green)' : '#555',
-                  fontSize: '1.1rem',
-                  padding: '12px 32px',
-                  fontWeight: 700
-                }}
               >
-                {quality.isStable ? '🔍 10봉지 검수 시작' : '카메라 안정화 중...'}
+                📸 촬영 및 검수
               </button>
             </div>
           </div>
