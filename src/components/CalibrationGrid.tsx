@@ -24,39 +24,44 @@ export const CalibrationGrid: React.FC<CalibrationGridProps> = ({ initialCanvas,
 
     // Render the still image onto the display canvas
     useEffect(() => {
+        console.log('[CalibGrid] useEffect: initialCanvas=', !!initialCanvas, 'canvasRef=', !!canvasRef.current);
         if (initialCanvas && canvasRef.current) {
             const parent = containerRef.current;
             const ctx = canvasRef.current.getContext('2d');
             if (ctx && parent) {
-                // We scale the display canvas to fit the screen while keeping aspect ratio.
-                // We must map taps back to the intrinsic resolution of the `initialCanvas` before warping.
-
                 const aspect = initialCanvas.width / initialCanvas.height;
-                const width = parent.clientWidth;
+                const width = parent.clientWidth || 320;
                 const height = width / aspect;
 
                 canvasRef.current.width = width;
                 canvasRef.current.height = height;
 
                 ctx.drawImage(initialCanvas, 0, 0, width, height);
+                console.log(`[CalibGrid] Drew image ${width}x${height}`);
             }
         }
     }, [initialCanvas]);
 
-    const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+        e.preventDefault();
         if (points.length >= 4) return;
 
         const rect = canvasRef.current?.getBoundingClientRect();
         if (!rect) return;
 
-        // Calculate relative coordinates on the scaled display canvas
         const x = e.clientX - rect.left;
         const y = e.clientY - rect.top;
+        console.log(`[CalibGrid] Point ${points.length + 1}/4 tapped at (${x.toFixed(0)}, ${y.toFixed(0)})`);
 
-        setPoints(prev => {
-            const newPoints = [...prev, { x, y }];
-            return newPoints;
-        });
+        setPoints(prev => [...prev, { x, y }]);
+    };
+
+    // Skip calibration entirely — use full-frame corners for quick dev testing
+    const skipCalibration = () => {
+        if (initialCanvas) {
+            console.log('[CalibGrid] Skipping calibration, using full frame');
+            onWarpComplete(initialCanvas);
+        }
     };
 
     const executeWarp = async () => {
@@ -138,24 +143,32 @@ export const CalibrationGrid: React.FC<CalibrationGridProps> = ({ initialCanvas,
                 <div style={{ position: 'relative', display: 'inline-block' }}>
                     <canvas
                         ref={canvasRef}
-                        onClick={handleCanvasClick}
+                        onPointerDown={handlePointerDown}
                         style={{
                             display: 'block',
                             cursor: points.length < 4 ? 'crosshair' : 'default',
-                            boxShadow: '0 4px 20px rgba(0,0,0,0.5)'
+                            boxShadow: '0 4px 20px rgba(0,0,0,0.5)',
+                            touchAction: 'none'
                         }}
                     />
                     {drawPointMarkers()}
                 </div>
             </div>
 
-            <div style={{ padding: '20px', display: 'flex', gap: '16px', justifyContent: 'center', background: 'rgba(0,0,0,0.8)' }}>
-                <button className="btn" style={{ background: 'var(--panel-bg)' }} onClick={onRetake}>
-                    Retake Photo
+            <div style={{ padding: '20px', display: 'flex', gap: '12px', justifyContent: 'center', background: 'rgba(0,0,0,0.8)', flexWrap: 'wrap' }}>
+                <button className="btn" style={{ background: 'var(--panel-bg)', fontSize: '0.85rem' }} onClick={onRetake}>
+                    Retake
                 </button>
                 <button
                     className="btn"
-                    style={{ background: points.length < 4 ? 'var(--panel-bg)' : 'var(--accent-blue)' }}
+                    style={{ background: 'var(--accent-green)', fontSize: '0.85rem' }}
+                    onClick={skipCalibration}
+                >
+                    Skip (Use Full Frame)
+                </button>
+                <button
+                    className="btn"
+                    style={{ background: points.length < 4 ? 'var(--panel-bg)' : 'var(--accent-blue)', fontSize: '0.85rem' }}
                     disabled={points.length < 4}
                     onClick={executeWarp}
                 >
