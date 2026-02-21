@@ -1,130 +1,106 @@
 import { useState, useEffect, useCallback } from 'react';
 import './index.css';
 import { DeviceHealthCheck } from './pages/DeviceHealthCheck';
+import { TestMode } from './pages/TestMode';
+import { DataCollect } from './pages/DataCollect';
 import { CameraView, QualityMetrics } from './components/CameraView';
 import { ResultPanel } from './components/ResultPanel';
 import { ComputerVision } from './services/ComputerVision';
 import { MvpInferenceService } from './services/Inference';
 import { BatchProcessingResult, PipelineMetrics } from './services/Metrics';
 
-type AppState =
-  | 'INIT'
-  | 'CAMERA_READY'
-  | 'READY_TO_SCAN'
-  | 'SCANNING'
-  | 'RESULT'
-  | 'RESCAN'
-  | 'DIAGNOSTICS';
+type AppTab = '검수' | '테스트' | '데이터수집' | '진단';
 
-const STATE_LABELS: Record<AppState, string> = {
+type ScanState = 'INIT' | 'CAMERA' | 'SCANNING' | 'RESULT';
+
+const STATE_LABELS: Record<ScanState, string> = {
   INIT: '초기화',
-  CAMERA_READY: '카메라 준비',
-  READY_TO_SCAN: '스캔 대기',
+  CAMERA: '카메라',
   SCANNING: '분석중',
   RESULT: '결과',
-  RESCAN: '재스캔',
-  DIAGNOSTICS: '진단',
 };
 
 function App() {
-  const [appState, setAppState] = useState<AppState>('INIT');
+  const [activeTab, setActiveTab] = useState<AppTab>('검수');
+  const [scanState, setScanState] = useState<ScanState>('INIT');
   const [quality, setQuality] = useState<QualityMetrics>({ isStable: false, glareScore: 0, blurScore: 0 });
   const [result, setResult] = useState<BatchProcessingResult | null>(null);
 
-  // Try to lock landscape orientation on mount
+  // Landscape lock
   useEffect(() => {
     try {
       const sl = screen.orientation as any;
       if (sl?.lock) sl.lock('landscape').catch(() => { });
-    } catch (_) { /* not supported */ }
+    } catch (_) { }
   }, []);
 
-  // Wait for OpenCV initialization
+  // OpenCV init
   useEffect(() => {
-    const handleOpenCVReady = () => {
-      console.log('OpenCV.js loaded');
-      if (appState === 'INIT') setAppState('CAMERA_READY');
+    const handleReady = () => {
+      if (scanState === 'INIT') setScanState('CAMERA');
     };
-
     if (window.cv && window.cv.Mat) {
-      handleOpenCVReady();
+      handleReady();
     } else {
-      window.addEventListener('opencv-ready', handleOpenCVReady);
+      window.addEventListener('opencv-ready', handleReady);
     }
-
-    return () => window.removeEventListener('opencv-ready', handleOpenCVReady);
-  }, [appState]);
+    return () => window.removeEventListener('opencv-ready', handleReady);
+  }, [scanState]);
 
   const handleFrameReady = useCallback((canvas: HTMLCanvasElement) => {
-    if (appState === 'CAMERA_READY' || appState === 'READY_TO_SCAN') {
+    if (scanState === 'CAMERA') {
       const q = ComputerVision.evaluateQualityGate(canvas);
       setQuality(q);
     }
-  }, [appState]);
-
-
-
-  const executeTrackAScan = async () => {
-    setAppState('SCANNING');
-    const startOverall = performance.now();
-    const captureMs = 12.4;
-    const warpMs = 18.2;
-
-    const inferenceResult = await MvpInferenceService.runTrackAStub(10);
-    const endOverall = performance.now();
-
-    const finalMetrics: PipelineMetrics = {
-      ...inferenceResult.metrics,
-      captureMs,
-      warpMs,
-      totalMs: endOverall - startOverall + captureMs + warpMs
-    };
-
-    setResult({ ...inferenceResult, metrics: finalMetrics });
-    setAppState('RESULT');
-  };
+  }, [scanState]);
 
   const getQualityKorean = (): string | undefined => {
     if (!quality.rejectionReason) return undefined;
-    if (quality.rejectionReason.includes('blurry')) return '📷 화면이 흔들립니다. 카메라를 고정해주세요.';
-    if (quality.rejectionReason.includes('glare')) return '💡 빛 반사가 심합니다. 각도를 조절해주세요.';
-    if (quality.rejectionReason.includes('CV not loaded')) return '⏳ 엔진 로딩중...';
+    if (quality.rejectionReason.includes('blurry')) return '📷 흔들림 — 고정해주세요';
+    if (quality.rejectionReason.includes('glare')) return '💡 빛반사 — 각도 조절';
+    if (quality.rejectionReason.includes('CV not loaded')) return '⏳ 로딩중...';
     return quality.rejectionReason;
   };
 
-  const renderContent = () => {
-    switch (appState) {
+  const executeScan = async () => {
+    setScanState('SCANNING');
+    const start = performance.now();
+    const inferenceResult = await MvpInferenceService.runTrackAStub(10);
+    const end = performance.now();
+
+    const metrics: PipelineMetrics = {
+      ...inferenceResult.metrics,
+      captureMs: 12.4,
+      warpMs: 18.2,
+      totalMs: end - start + 30.6
+    };
+
+    setResult({ ...inferenceResult, metrics });
+    setScanState('RESULT');
+  };
+
+  // Render scan tab content
+  const renderScanContent = () => {
+    switch (scanState) {
       case 'INIT':
         return (
           <div className="viewport-wrapper">
             <div style={{ textAlign: 'center' }}>
-              <h2 className="text-gradient" style={{ fontSize: '1.2rem' }}>AI 약봉지 검수 시스템</h2>
-              <p style={{ color: 'var(--text-secondary)', marginTop: '8px', fontSize: '0.9rem' }}>
-                OpenCV 엔진 로딩중...
-              </p>
+              <h2 className="text-gradient" style={{ fontSize: '1.2rem' }}>AI 약봉지 검수</h2>
+              <p style={{ color: 'var(--text-secondary)', marginTop: '8px', fontSize: '0.9rem' }}>엔진 로딩중...</p>
             </div>
           </div>
         );
 
-      case 'DIAGNOSTICS':
-        return <DeviceHealthCheck />;
-
-      case 'CAMERA_READY':
-      case 'READY_TO_SCAN':
-      case 'RESCAN':
+      case 'CAMERA':
         return (
           <div className="viewport-wrapper">
             <CameraView isActive={true} onFrameReady={handleFrameReady} onQualityUpdate={setQuality} />
             <div className="camera-overlay">
               {!quality.isStable && getQualityKorean() && (
-                <div className="quality-pill">
-                  {getQualityKorean()}
-                </div>
+                <div className="quality-pill">{getQualityKorean()}</div>
               )}
-              <button
-                className="btn scan-btn"
-                onClick={executeTrackAScan}
-              >
+              <button className="btn scan-btn" onClick={executeScan}>
                 📸 촬영 및 검수
               </button>
             </div>
@@ -136,7 +112,7 @@ function App() {
           <div className="viewport-wrapper">
             <div style={{ textAlign: 'center' }}>
               <h2 className="text-gradient" style={{ fontSize: '1.3rem' }}>분석 중...</h2>
-              <p style={{ color: 'var(--text-secondary)', marginTop: '8px' }}>알약 수량을 확인하고 있습니다</p>
+              <p style={{ color: 'var(--text-secondary)', marginTop: '8px' }}>알약 수량 확인 중</p>
             </div>
           </div>
         );
@@ -144,7 +120,7 @@ function App() {
       case 'RESULT':
         return (
           <div className="viewport-wrapper" style={{ alignItems: 'stretch' }}>
-            {result && <ResultPanel result={result} expectedCount={10} onRescan={() => setAppState('READY_TO_SCAN')} />}
+            {result && <ResultPanel result={result} expectedCount={10} onRescan={() => setScanState('CAMERA')} />}
           </div>
         );
 
@@ -153,18 +129,19 @@ function App() {
     }
   };
 
-  const getStatusClass = (state: AppState) => {
-    if (state === 'INIT') return 'status-init';
-    if (state === 'CAMERA_READY' || state === 'READY_TO_SCAN') return 'status-ready';
-    if (state === 'SCANNING') return 'status-scanning';
-    if (state === 'RESCAN' || state === 'RESULT') return 'status-error';
-    if (state === 'DIAGNOSTICS') return 'status-calibrating';
-    return 'status-init';
+  // Render active tab
+  const renderContent = () => {
+    switch (activeTab) {
+      case '검수': return renderScanContent();
+      case '테스트': return <TestMode />;
+      case '데이터수집': return <DataCollect />;
+      case '진단': return <DeviceHealthCheck />;
+    }
   };
 
   return (
     <>
-      {/* Portrait rotation warning */}
+      {/* Portrait warning */}
       <div className="portrait-warning">
         <div className="rotate-icon">📱</div>
         <p><strong>가로 모드</strong>로 전환해주세요</p>
@@ -172,20 +149,39 @@ function App() {
       </div>
 
       <div className="app-container">
+        {/* Header with tabs */}
         <header className="header">
-          <h1>💊 약봉지 검수 <span style={{ fontSize: '0.7rem', color: 'var(--text-secondary)' }}>MVP</span></h1>
+          <h1 style={{ whiteSpace: 'nowrap' }}>💊 약봉지 검수</h1>
 
-          <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-            <span className={`status-badge ${getStatusClass(appState)}`}>
-              {STATE_LABELS[appState]}
-            </span>
+          {/* Tab navigation */}
+          <nav className="tab-nav">
+            {(['검수', '테스트', '데이터수집'] as AppTab[]).map(tab => (
+              <button
+                key={tab}
+                className={`tab-btn ${activeTab === tab ? 'active' : ''}`}
+                onClick={() => {
+                  setActiveTab(tab);
+                  if (tab === '검수' && scanState === 'RESULT') setScanState('CAMERA');
+                }}
+              >
+                {tab === '검수' && '🔍 '}
+                {tab === '테스트' && '🧪 '}
+                {tab === '데이터수집' && '📷 '}
+                {tab}
+              </button>
+            ))}
+          </nav>
 
-            <button
-              className="btn"
-              style={{ padding: '4px 10px', fontSize: '0.75rem', background: 'transparent', border: '1px solid var(--panel-border)' }}
-              onClick={() => setAppState(appState === 'DIAGNOSTICS' ? 'INIT' : 'DIAGNOSTICS')}
-            >
-              {appState === 'DIAGNOSTICS' ? '닫기' : '진단'}
+          <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+            {activeTab === '검수' && (
+              <span className={`status-badge ${scanState === 'INIT' ? 'status-init' : scanState === 'CAMERA' ? 'status-ready' : scanState === 'SCANNING' ? 'status-scanning' : 'status-error'}`}>
+                {STATE_LABELS[scanState]}
+              </span>
+            )}
+            <button className="btn"
+              style={{ padding: '3px 8px', fontSize: '0.7rem', background: 'transparent', border: '1px solid var(--panel-border)' }}
+              onClick={() => setActiveTab(activeTab === '진단' ? '검수' : '진단')}>
+              {activeTab === '진단' ? '닫기' : '⚙'}
             </button>
           </div>
         </header>
