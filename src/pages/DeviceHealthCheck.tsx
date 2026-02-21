@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import * as ort from 'onnxruntime-web/webgpu';
+import { InferenceService } from '../services/Inference';
 
 // Explicitly bind WASM path as per ORT documentation to prevent Vite resolution errors
 ort.env.wasm.wasmPaths = '/ort-wasm/';
@@ -9,6 +10,9 @@ export const DeviceHealthCheck: React.FC = () => {
     const [ortStatus, setOrtStatus] = useState<string>('Checking...');
     const [cameraStatus, setCameraStatus] = useState<string>('Checking...');
     const [inferenceStatus, setInferenceStatus] = useState<string>('Pending...');
+    const [inferenceTime, setInferenceTime] = useState<number | null>(null);
+
+    const inferenceSvc = new InferenceService();
 
     useEffect(() => {
         checkHealth();
@@ -57,8 +61,33 @@ export const DeviceHealthCheck: React.FC = () => {
             setCameraStatus(`❌ Camera Error: ${e.message} (Check Permissions)`);
         }
 
-        // 4. Inference capability
-        setInferenceStatus('⚠️ Awaiting Track B ONNX model for E2E timing tests.');
+        // 4. Test Infer
+        setInferenceStatus('⚠️ Awaiting manual test trigger');
+    };
+
+    const runTestInference = async () => {
+        setInferenceStatus('⏳ Loading dummy model and executing...');
+        const start = performance.now();
+        try {
+            const initSuccess = await inferenceSvc.initializeSession('/models/dummy.onnx');
+            if (!initSuccess) {
+                setInferenceStatus('❌ Failed to initialize dummy ORT session.');
+                return;
+            }
+
+            // Create dummy input tensor to satisfy the dummy.onnx model signature [1, 3, 224, 224]
+            const dummyData = new Float32Array(1 * 3 * 224 * 224);
+            const dummyTensor = new ort.Tensor('float32', dummyData, [1, 3, 224, 224]);
+
+            const res = await inferenceSvc.runTrackBDummy(dummyTensor);
+            const end = performance.now();
+
+            const shapeArr = res.shape ? res.shape.split('x') : [];
+            setInferenceStatus(`✅ Inference Success: Tensor Shape [${shapeArr.join(', ')}]`);
+            setInferenceTime(end - start);
+        } catch (e: any) {
+            setInferenceStatus(`❌ Inference Error: ${e.message}`);
+        }
     };
 
     return (
@@ -88,9 +117,21 @@ export const DeviceHealthCheck: React.FC = () => {
 
             <div style={{ marginBottom: '12px' }}>
                 <strong>Track B Inference:</strong>
-                <p style={{ marginTop: '4px', fontSize: '0.9rem', color: 'var(--text-secondary)' }}>
+                <p style={{ marginTop: '4px', fontSize: '0.9rem', color: inferenceStatus.includes('✅') ? 'var(--accent-green)' : inferenceStatus.includes('❌') ? 'var(--accent-red)' : 'var(--text-secondary)' }}>
                     {inferenceStatus}
                 </p>
+                {inferenceTime !== null && (
+                    <p style={{ marginTop: '2px', fontSize: '0.8rem', color: 'var(--accent-blue)' }}>
+                        Execution Time: {inferenceTime.toFixed(2)} ms
+                    </p>
+                )}
+                <button
+                    className="btn"
+                    onClick={runTestInference}
+                    style={{ marginTop: '8px', padding: '6px 12px', fontSize: '0.8rem', border: '1px solid var(--panel-border)', background: 'transparent' }}
+                >
+                    Run Test Inference (Dummy)
+                </button>
             </div>
 
             <button className="btn" onClick={checkHealth} style={{ width: '100%', marginTop: '16px' }}>
