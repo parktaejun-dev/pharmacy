@@ -1,14 +1,12 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { PillDetector } from '../services/PillDetector';
-import { BatchProcessingResult, PipelineMetrics, InferenceResult, BoundingBox } from '../services/Metrics';
+import { BatchProcessingResult, PipelineMetrics, InferenceResult } from '../services/Metrics';
 import { ResultPanel } from '../components/ResultPanel';
 
 interface TestSample {
     id: string;
     name: string;
     imageUrl: string;
-    expectedPerBag: number;
-    bagCount: number;
     description: string;
     label: '정상' | '이상';
 }
@@ -18,8 +16,6 @@ const TEST_SAMPLES: TestSample[] = [
         id: 'normal_5',
         name: '정상 세트 (5알×10봉지)',
         imageUrl: '/testset/normal_5pills.png',
-        expectedPerBag: 5,
-        bagCount: 10,
         description: '10봉지 모두 5알씩 정상 포장',
         label: '정상'
     },
@@ -27,8 +23,6 @@ const TEST_SAMPLES: TestSample[] = [
         id: 'fail_missing',
         name: '이상 세트 (알약 부족)',
         imageUrl: '/testset/fail_missing_pills.png',
-        expectedPerBag: 5,
-        bagCount: 10,
         description: '일부 봉지에 알약 부족 — 이상 감지 테스트',
         label: '이상'
     }
@@ -48,38 +42,49 @@ export const TestMode: React.FC = () => {
         setDetectionLog('이미지 로딩 중...');
     };
 
-    // Run detection once image is loaded
     useEffect(() => {
         if (!isRunning || !selectedSample || !imgRef.current) return;
 
         const img = imgRef.current;
         const handleLoad = () => {
             setDetectionLog('OpenCV 감지 실행 중...');
-
             const startTime = performance.now();
 
-            // Run real OpenCV detection
+            // Real OpenCV detection
             const allBoxes = PillDetector.detectFromImage(img);
             const inferEnd = performance.now();
 
-            setDetectionLog(`${allBoxes.length}개 알약 감지 완료 (${(inferEnd - startTime).toFixed(0)}ms)`);
+            // Cluster into bags by x-coordinate gaps
+            const clusters = PillDetector.clusterIntoBags(allBoxes);
 
-            // Assign boxes to bags based on x position
-            const bagResults = assignBoxesToBags(allBoxes, selectedSample.bagCount, selectedSample.expectedPerBag);
+            // Auto-detect expected count = mode (most common count)
+            const counts = clusters.map(c => c.length);
+            const freq: Record<number, number> = {};
+            counts.forEach(c => freq[c] = (freq[c] || 0) + 1);
+            const autoExpected = Object.entries(freq).sort((a, b) => Number(b[1]) - Number(a[1]))[0]?.[0];
+            const expectedPerBag = autoExpected ? parseInt(autoExpected) : 0;
 
-            const overallPass = bagResults.every(r => r.boxCount === selectedSample.expectedPerBag);
+            const bagResults: InferenceResult[] = clusters.map(bagBoxes => ({
+                boxCount: bagBoxes.length,
+                confidenceAverage: bagBoxes.length > 0 ? bagBoxes.reduce((s, b) => s + b.confidence, 0) / bagBoxes.length : 0,
+                passedExpectedCount: bagBoxes.length === expectedPerBag,
+                boxes: bagBoxes
+            }));
+
+            const overallPass = bagResults.length > 0 && bagResults.every(r => r.passedExpectedCount);
             const renderEnd = performance.now();
 
+            setDetectionLog(`${allBoxes.length}개 알약 → ${clusters.length}봉지 (기대 ${expectedPerBag}알/봉, ${(inferEnd - startTime).toFixed(0)}ms)`);
+
             const metrics: PipelineMetrics = {
-                captureMs: 0,
-                warpMs: 0,
+                captureMs: 0, warpMs: 0,
                 inferMs: inferEnd - startTime,
                 postprocessMs: renderEnd - inferEnd,
                 renderMs: 1,
                 totalMs: renderEnd - startTime
             };
 
-            setResult({ results: bagResults, metrics, overallPass });
+            setResult({ results: bagResults, metrics, overallPass, expectedPerBag });
             setIsRunning(false);
         };
 
@@ -93,7 +98,7 @@ export const TestMode: React.FC = () => {
     if (result && selectedSample) {
         return (
             <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
-                <div style={{ padding: '8px 12px', background: 'rgba(0,0,0,0.6)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div style={{ padding: '8px 12px', background: 'rgba(0,0,0,0.6)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', zIndex: 20 }}>
                     <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
                         테스트: <strong style={{ color: 'var(--text-primary)' }}>{selectedSample.name}</strong>
                         <span style={{ marginLeft: '8px', fontSize: '0.75rem', color: 'var(--accent-blue)' }}>
@@ -105,9 +110,13 @@ export const TestMode: React.FC = () => {
                         ← 목록으로
                     </button>
                 </div>
-                <div style={{ flex: 1, display: 'flex' }}>
-                    <ResultPanel result={result} expectedCount={selectedSample.expectedPerBag}
-                        onRescan={() => { setResult(null); setSelectedSample(null); }} />
+                <div style={{ flex: 1, position: 'relative' }}>
+                    <ResultPanel
+                        result={result}
+                        expectedCount={result.expectedPerBag || 0}
+                        imageUrl={selectedSample.imageUrl}
+                        onRescan={() => { setResult(null); setSelectedSample(null); }}
+                    />
                 </div>
             </div>
         );
@@ -124,7 +133,6 @@ export const TestMode: React.FC = () => {
 
             {isRunning && (
                 <>
-                    {/* Hidden image for detection */}
                     <img ref={imgRef} src={selectedSample?.imageUrl}
                         crossOrigin="anonymous"
                         style={{ position: 'absolute', opacity: 0, pointerEvents: 'none' }}
@@ -172,27 +180,3 @@ export const TestMode: React.FC = () => {
         </div>
     );
 };
-
-/**
- * Assign detected bounding boxes to bag regions.
- * Divides the image into N equal vertical strips and assigns each box to the nearest bag.
- */
-function assignBoxesToBags(boxes: BoundingBox[], bagCount: number, expectedPerBag: number): InferenceResult[] {
-    const bagWidth = 1.0 / bagCount;
-
-    const bags: BoundingBox[][] = Array(bagCount).fill(null).map(() => []);
-
-    for (const box of boxes) {
-        const bagIdx = Math.min(bagCount - 1, Math.max(0, Math.floor(box.x / bagWidth)));
-        bags[bagIdx].push(box);
-    }
-
-    return bags.map(bagBoxes => ({
-        boxCount: bagBoxes.length,
-        confidenceAverage: bagBoxes.length > 0
-            ? bagBoxes.reduce((sum, b) => sum + b.confidence, 0) / bagBoxes.length
-            : 0,
-        passedExpectedCount: bagBoxes.length === expectedPerBag,
-        boxes: bagBoxes
-    }));
-}
