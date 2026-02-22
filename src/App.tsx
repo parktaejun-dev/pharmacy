@@ -19,12 +19,12 @@ const STATE_LABELS: Record<ScanState, string> = {
   RESULT: '결과',
 };
 
-const EXPECTED_PILLS = 5; // Expected pills per bag
 
 function App() {
   const [activeTab, setActiveTab] = useState<AppTab>('검수');
   const [scanState, setScanState] = useState<ScanState>('INIT');
   const [quality, setQuality] = useState<QualityMetrics>({ isStable: false, glareScore: 0, blurScore: 0 });
+  const [expectedPills, setExpectedPills] = useState(5);
   const [result, setResult] = useState<BatchProcessingResult | null>(null);
   const [capturedImageUrl, setCapturedImageUrl] = useState<string | null>(null);
   const latestFrameCanvas = useRef<HTMLCanvasElement | null>(null);
@@ -93,7 +93,7 @@ function App() {
     const bagResults: InferenceResult[] = clusters.map(bagBoxes => ({
       boxCount: bagBoxes.length,
       confidenceAverage: bagBoxes.length > 0 ? bagBoxes.reduce((s, b) => s + b.confidence, 0) / bagBoxes.length : 0,
-      passedExpectedCount: bagBoxes.length === EXPECTED_PILLS,
+      passedExpectedCount: bagBoxes.length === expectedPills,
       boxes: bagBoxes
     }));
 
@@ -136,9 +136,18 @@ function App() {
               {!quality.isStable && getQualityKorean() && (
                 <div className="quality-pill">{getQualityKorean()}</div>
               )}
-              <button className="btn scan-btn" onClick={executeScan}>
-                📸<br />촬영
-              </button>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', alignItems: 'center' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', background: 'rgba(0,0,0,0.5)', borderRadius: '8px', padding: '4px 10px' }}>
+                  <label style={{ fontSize: '0.7rem', color: 'rgba(255,255,255,0.7)' }}>기대알수</label>
+                  <input type="number" value={expectedPills} min={1} max={30}
+                    onChange={e => setExpectedPills(Math.max(1, parseInt(e.target.value) || 1))}
+                    style={{ width: '40px', textAlign: 'center', background: 'rgba(255,255,255,0.15)', border: '1px solid rgba(255,255,255,0.3)', borderRadius: '4px', color: '#fff', fontSize: '0.9rem', padding: '2px' }}
+                  />
+                </div>
+                <button className="btn scan-btn" onClick={executeScan}>
+                  📸<br />촬영
+                </button>
+              </div>
             </div>
           </div>
         );
@@ -155,7 +164,7 @@ function App() {
 
       case 'RESULT':
         return result ? (
-          <ResultPanel result={result} expectedCount={EXPECTED_PILLS} imageUrl={capturedImageUrl || undefined} onRescan={() => setScanState('CAMERA')} />
+          <ResultPanel result={result} expectedCount={expectedPills} imageUrl={capturedImageUrl || undefined} onRescan={() => setScanState('CAMERA')} />
         ) : null;
 
       default:
