@@ -55,45 +55,55 @@ const BBoxOverlay: React.FC<{
             ctx.fillRect(bx, by, bw, bh);
         });
 
-        // --- Draw per-bag pill counts below each bag column ---
-        const bagCount = bagResults.length;
-        const bagWidth = canvas.width / bagCount;
-
+        // --- Draw per-bag pill counts at the centroid of each bag cluster ---
         bagResults.forEach((bag, i) => {
-            const isPass = bag.boxCount === expectedCount;
-            const cx = (i + 0.5) * bagWidth;
-            const labelY = canvas.height - 8;
+            if (bag.boxes.length === 0) return;
 
-            // Background pill for count
+            const isPass = bag.boxCount === expectedCount;
+
+            // Find bounding box of this bag's pills
+            const xs = bag.boxes.map(b => b.x);
+            const ys = bag.boxes.map(b => b.y);
+            const minX = Math.min(...xs) - 0.01;
+            const maxX = Math.max(...xs) + 0.01;
+            const maxY = Math.max(...ys);
+
+            // Center x of cluster
+            const cx = ((minX + maxX) / 2) * canvas.width;
+            const labelY = (maxY + 0.04) * canvas.height; // below the lowest pill
+
+            // Count badge
             const countText = `${bag.boxCount}`;
             ctx.font = 'bold 14px sans-serif';
             const tw = ctx.measureText(countText).width;
             const pillW = Math.max(tw + 12, 24);
             const pillH = 20;
 
-            // Background
             ctx.fillStyle = isPass ? 'rgba(16, 185, 129, 0.9)' : 'rgba(239, 68, 68, 0.9)';
             ctx.beginPath();
-            ctx.roundRect(cx - pillW / 2, labelY - pillH, pillW, pillH, 4);
+            ctx.roundRect(cx - pillW / 2, labelY - pillH / 2, pillW, pillH, 4);
             ctx.fill();
 
-            // Count text
             ctx.fillStyle = '#fff';
             ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
-            ctx.fillText(countText, cx, labelY - pillH / 2);
+            ctx.fillText(countText, cx, labelY);
 
-            // Bag number above count
-            ctx.font = '10px sans-serif';
-            ctx.fillStyle = 'rgba(255,255,255,0.6)';
-            ctx.fillText(`${i + 1}`, cx, labelY - pillH - 8);
+            // Bag number above
+            ctx.font = '9px sans-serif';
+            ctx.fillStyle = 'rgba(255,255,255,0.5)';
+            ctx.fillText(`${i + 1}번`, cx, labelY - pillH / 2 - 8);
 
-            // If anomaly, draw red border around the bag column
+            // If anomaly, outline the cluster region
             if (!isPass) {
+                const rx = minX * canvas.width;
+                const ry = Math.min(...ys.map(y => y - 0.02)) * canvas.height;
+                const rw = (maxX - minX) * canvas.width;
+                const rh = (maxY - Math.min(...ys) + 0.04) * canvas.height;
                 ctx.strokeStyle = 'rgba(239, 68, 68, 0.6)';
                 ctx.lineWidth = 2;
                 ctx.setLineDash([4, 4]);
-                ctx.strokeRect(i * bagWidth + 1, 0, bagWidth - 2, canvas.height - 30);
+                ctx.strokeRect(rx, ry, rw, rh);
                 ctx.setLineDash([]);
             }
         });

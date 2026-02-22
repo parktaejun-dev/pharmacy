@@ -7,26 +7,9 @@ import { CameraView, QualityMetrics } from './components/CameraView';
 import { ResultPanel } from './components/ResultPanel';
 import { ComputerVision } from './services/ComputerVision';
 import { PillDetector } from './services/PillDetector';
-import { BatchProcessingResult, PipelineMetrics, InferenceResult, BoundingBox } from './services/Metrics';
-
-// Assign detected boxes to bag columns by x position
-function assignBoxesToBags(boxes: BoundingBox[], bagCount: number, expectedPerBag: number): InferenceResult[] {
-  const bagWidth = 1.0 / bagCount;
-  const bags: BoundingBox[][] = Array(bagCount).fill(null).map(() => []);
-  for (const box of boxes) {
-    const bagIdx = Math.min(bagCount - 1, Math.max(0, Math.floor(box.x / bagWidth)));
-    bags[bagIdx].push(box);
-  }
-  return bags.map(bagBoxes => ({
-    boxCount: bagBoxes.length,
-    confidenceAverage: bagBoxes.length > 0 ? bagBoxes.reduce((s, b) => s + b.confidence, 0) / bagBoxes.length : 0,
-    passedExpectedCount: bagBoxes.length === expectedPerBag,
-    boxes: bagBoxes
-  }));
-}
+import { BatchProcessingResult, PipelineMetrics, InferenceResult } from './services/Metrics';
 
 type AppTab = '검수' | '테스트' | '데이터수집' | '진단';
-
 type ScanState = 'INIT' | 'CAMERA' | 'SCANNING' | 'RESULT';
 
 const STATE_LABELS: Record<ScanState, string> = {
@@ -36,8 +19,7 @@ const STATE_LABELS: Record<ScanState, string> = {
   RESULT: '결과',
 };
 
-const EXPECTED_PILLS = 10;
-const BAG_COUNT = 10;
+const EXPECTED_PILLS = 5; // Expected pills per bag
 
 function App() {
   const [activeTab, setActiveTab] = useState<AppTab>('검수');
@@ -106,13 +88,19 @@ function App() {
     const allBoxes = PillDetector.detectFromCanvas(frameCanvas);
     const inferEnd = performance.now();
 
-    console.log(`🔍 Detected ${allBoxes.length} pills in ${(inferEnd - captureEnd).toFixed(0)}ms`);
+    // Group into bags by gap-based x-coordinate clustering
+    const clusters = PillDetector.clusterIntoBags(allBoxes);
+    const bagResults: InferenceResult[] = clusters.map(bagBoxes => ({
+      boxCount: bagBoxes.length,
+      confidenceAverage: bagBoxes.length > 0 ? bagBoxes.reduce((s, b) => s + b.confidence, 0) / bagBoxes.length : 0,
+      passedExpectedCount: bagBoxes.length === EXPECTED_PILLS,
+      boxes: bagBoxes
+    }));
 
-    // Assign boxes to bags by x position
-    const bagResults = assignBoxesToBags(allBoxes, BAG_COUNT, EXPECTED_PILLS);
-
-    const overallPass = bagResults.every(r => r.boxCount === EXPECTED_PILLS);
+    const overallPass = bagResults.length > 0 && bagResults.every(r => r.passedExpectedCount);
     const renderEnd = performance.now();
+
+    console.log(`🔍 ${allBoxes.length} pills → ${clusters.length} bags: [${bagResults.map(r => r.boxCount).join(', ')}]`);
 
     const metrics: PipelineMetrics = {
       captureMs: captureEnd - start,
