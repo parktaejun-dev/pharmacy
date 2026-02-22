@@ -24,7 +24,8 @@ export interface InferenceResult {
 }
 
 export interface BatchProcessingResult {
-    results: InferenceResult[]; // Should be length 10
+    results: InferenceResult[];
     metrics: PipelineMetrics;
     overallPass: boolean;
+    expectedPerBag?: number;  // auto-detected from mode of cluster sizes
 }

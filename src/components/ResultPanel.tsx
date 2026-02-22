@@ -8,10 +8,6 @@ interface ResultPanelProps {
     imageUrl?: string;
 }
 
-/**
- * Draws green bounding boxes on detected pills,
- * and per-bag pill counts below each bag column.
- */
 const BBoxOverlay: React.FC<{
     boxes: BoundingBox[],
     bagResults: InferenceResult[],
@@ -38,41 +34,31 @@ const BBoxOverlay: React.FC<{
         if (!ctx) return;
         ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-        // --- Draw bounding boxes for each pill ---
+        // Green boxes on all detected pills
         boxes.forEach(box => {
             const bx = (box.x - box.w / 2) * canvas.width;
             const by = (box.y - box.h / 2) * canvas.height;
             const bw = box.w * canvas.width;
             const bh = box.h * canvas.height;
-
-            // All detected pills get green boxes
             ctx.strokeStyle = '#10b981';
             ctx.lineWidth = 2;
             ctx.strokeRect(bx, by, bw, bh);
-
-            // Semi-transparent fill
             ctx.fillStyle = 'rgba(16, 185, 129, 0.15)';
             ctx.fillRect(bx, by, bw, bh);
         });
 
-        // --- Draw per-bag pill counts at the centroid of each bag cluster ---
+        // Per-bag count labels at cluster centroids
         bagResults.forEach((bag, i) => {
             if (bag.boxes.length === 0) return;
-
             const isPass = bag.boxCount === expectedCount;
-
-            // Find bounding box of this bag's pills
             const xs = bag.boxes.map(b => b.x);
             const ys = bag.boxes.map(b => b.y);
             const minX = Math.min(...xs) - 0.01;
             const maxX = Math.max(...xs) + 0.01;
             const maxY = Math.max(...ys);
-
-            // Center x of cluster
             const cx = ((minX + maxX) / 2) * canvas.width;
-            const labelY = (maxY + 0.04) * canvas.height; // below the lowest pill
+            const labelY = (maxY + 0.04) * canvas.height;
 
-            // Count badge
             const countText = `${bag.boxCount}`;
             ctx.font = 'bold 14px sans-serif';
             const tw = ctx.measureText(countText).width;
@@ -83,18 +69,15 @@ const BBoxOverlay: React.FC<{
             ctx.beginPath();
             ctx.roundRect(cx - pillW / 2, labelY - pillH / 2, pillW, pillH, 4);
             ctx.fill();
-
             ctx.fillStyle = '#fff';
             ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
             ctx.fillText(countText, cx, labelY);
 
-            // Bag number above
             ctx.font = '9px sans-serif';
             ctx.fillStyle = 'rgba(255,255,255,0.5)';
             ctx.fillText(`${i + 1}번`, cx, labelY - pillH / 2 - 8);
 
-            // If anomaly, outline the cluster region
             if (!isPass) {
                 const rx = minX * canvas.width;
                 const ry = Math.min(...ys.map(y => y - 0.02)) * canvas.height;
@@ -107,7 +90,6 @@ const BBoxOverlay: React.FC<{
                 ctx.setLineDash([]);
             }
         });
-
     }, [boxes, bagResults, expectedCount, containerRef]);
 
     useEffect(() => {
@@ -123,27 +105,20 @@ const BBoxOverlay: React.FC<{
 export const ResultPanel: React.FC<ResultPanelProps> = ({ result, onRescan, expectedCount, imageUrl }) => {
     const allPass = result.results.every(r => r.boxCount === expectedCount);
     const totalDetected = result.results.reduce((sum, r) => sum + r.boxCount, 0);
-    const failCount = result.results.filter(r => r.boxCount !== expectedCount).length;
+    const failCount = result.results.filter(r => !r.passedExpectedCount).length;
     const allBoxes = result.results.flatMap(r => r.boxes || []);
     const containerRef = useRef<HTMLDivElement>(null);
-
     const bgImage = imageUrl || '/testset/normal_5pills.png';
 
     return (
         <div style={{ position: 'absolute', inset: 0, background: '#000', overflow: 'hidden' }}>
-
-            {/* Full-screen photo with bounding boxes */}
+            {/* Full-screen photo */}
             <div ref={containerRef} style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                 <img src={bgImage} alt="검수 결과" style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />
-                <BBoxOverlay
-                    boxes={allBoxes}
-                    bagResults={result.results}
-                    expectedCount={expectedCount}
-                    containerRef={containerRef}
-                />
+                <BBoxOverlay boxes={allBoxes} bagResults={result.results} expectedCount={expectedCount} containerRef={containerRef} />
             </div>
 
-            {/* Top: PASS/FAIL banner */}
+            {/* Top banner */}
             <div style={{
                 position: 'absolute', top: 0, left: 0, right: 0,
                 background: allPass
@@ -158,8 +133,8 @@ export const ResultPanel: React.FC<ResultPanelProps> = ({ result, onRescan, expe
                         {allPass ? '✅ 전량 정상' : '❌ 수량 이상 감지'}
                     </div>
                     <div style={{ fontSize: '0.75rem', color: 'rgba(255,255,255,0.9)', marginTop: '2px' }}>
-                        총 {totalDetected}알 감지 · {result.results.length}봉지 검사
-                        {!allPass && ` · ${failCount}봉지 이상`}
+                        총 {totalDetected}알 · {result.results.length}봉지 · 기대 {expectedCount}알/봉
+                        {failCount > 0 && ` · ${failCount}봉지 이상`}
                     </div>
                 </div>
                 <button onClick={onRescan} style={{
@@ -172,7 +147,7 @@ export const ResultPanel: React.FC<ResultPanelProps> = ({ result, onRescan, expe
                 </button>
             </div>
 
-            {/* Bottom-right: Performance */}
+            {/* Performance */}
             <div style={{
                 position: 'absolute', top: '8px', right: '140px',
                 background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(4px)',
