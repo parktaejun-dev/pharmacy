@@ -1,77 +1,63 @@
 import { BoundingBox } from './Metrics';
 
 /**
- * PillDetector v3 — Multi-strategy pill detection
+ * PillDetector v4 — Reliable pill counting
  *
- * Strategy 1: Adaptive threshold + connected components
- *   - Finds bright blobs (pills are brighter than bag background)
- *   - More robust than HoughCircles for non-perfect circles
- *
- * Strategy 2: HoughCircles (backup, relaxed params)
- *
- * Bag Grouping: Gap-based clustering on x-coordinates
- *   - Groups detected pills into bags by finding natural gaps
+ * Key improvements:
+ * - Otsu threshold (global, not adaptive) → less noise
+ * - Heavy morphological cleanup (open + close with large kernel)
+ * - Strict circularity filter (pills are round, text is not)
+ * - Large minimum area (pills are substantial, not tiny dots)
+ * - Color validation from HSV
+ * - HoughCircles as backup
+ * - NMS deduplication
  */
 export class PillDetector {
 
     static detectFromImage(imgElement: HTMLImageElement): BoundingBox[] {
         const cv = (window as any).cv;
         if (!cv || !cv.Mat) return [];
-
         const canvas = document.createElement('canvas');
         canvas.width = imgElement.naturalWidth || imgElement.width;
         canvas.height = imgElement.naturalHeight || imgElement.height;
         const ctx = canvas.getContext('2d');
         if (!ctx) return [];
         ctx.drawImage(imgElement, 0, 0, canvas.width, canvas.height);
-
         const src = cv.imread(canvas);
-        try {
-            return this.detect(cv, src);
-        } finally {
-            src.delete();
-        }
+        try { return this.detect(cv, src); }
+        finally { src.delete(); }
     }
 
     static detectFromCanvas(canvas: HTMLCanvasElement): BoundingBox[] {
         const cv = (window as any).cv;
         if (!cv || !cv.Mat) return [];
-
         const src = cv.imread(canvas);
-        try {
-            return this.detect(cv, src);
-        } finally {
-            src.delete();
-        }
+        try { return this.detect(cv, src); }
+        finally { src.delete(); }
     }
 
     private static detect(cv: any, src: any): BoundingBox[] {
         const W = src.cols;
         const H = src.rows;
 
-        // Strategy 1: Adaptive threshold + connected components
-        const blobBoxes = this.detectByBlobs(cv, src, W, H);
-
-        // Strategy 2: HoughCircles (relaxed)
+        const contourBoxes = this.detectByContours(cv, src, W, H);
         const circleBoxes = this.detectByCircles(cv, src, W, H);
+        const merged = this.nms([...contourBoxes, ...circleBoxes], 0.3);
 
-        // Merge both strategies with NMS
-        const merged = this.nonMaxSuppression([...blobBoxes, ...circleBoxes], 0.3);
-
-        console.log(`🔍 Detection: ${blobBoxes.length} blobs + ${circleBoxes.length} circles → ${merged.length} pills after NMS`);
-
+        console.log(`🔍 Detection: ${contourBoxes.length} contours + ${circleBoxes.length} circles → ${merged.length} pills`);
         return merged;
     }
 
     /**
-     * Strategy 1: Adaptive threshold → connected components → filter by size/shape
+     * Contour-based detection with strict filtering:
+     * 1. Otsu threshold (global binary — clean)
+     * 2. Heavy morphological cleanup (remove text, keep blobs)
+     * 3. Contour analysis with circularity > 0.5
+     * 4. Minimum area = relative to image size
      */
-    private static detectByBlobs(cv: any, src: any, W: number, H: number): BoundingBox[] {
+    private static detectByContours(cv: any, src: any, W: number, H: number): BoundingBox[] {
         const gray = new cv.Mat();
         const binary = new cv.Mat();
-        const labels = new cv.Mat();
-        const stats = new cv.Mat();
-        const centroids = new cv.Mat();
         const hsv = new cv.Mat();
 
         try {
@@ -83,95 +69,98 @@ export class PillDetector {
             cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV);
             rgb.delete();
 
-            // Gaussian blur to reduce noise
+            // Gaussian blur → Otsu threshold
             const blurred = new cv.Mat();
-            cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 1.5);
-
-            // Adaptive threshold — finds bright objects against local background
-            cv.adaptiveThreshold(
-                blurred, binary,
-                255,
-                cv.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv.THRESH_BINARY,
-                31,   // block size (neighborhood)
-                -8    // C constant (negative = find bright spots)
-            );
+            cv.GaussianBlur(gray, blurred, new cv.Size(7, 7), 2);
+            cv.threshold(blurred, binary, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
             blurred.delete();
 
-            // Morphological cleanup
-            const kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(3, 3));
-            cv.morphologyEx(binary, binary, cv.MORPH_OPEN, kernel);   // remove noise
-            cv.morphologyEx(binary, binary, cv.MORPH_CLOSE, kernel);  // fill gaps
+            // Heavy morphological cleanup — large kernel removes text but keeps pill-sized blobs
+            const minDim = Math.min(W, H);
+            const kernelSize = Math.max(5, Math.round(minDim * 0.008));
+            const kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(kernelSize, kernelSize));
+
+            // Open: remove small noise (text, edges, artifacts)
+            cv.morphologyEx(binary, binary, cv.MORPH_OPEN, kernel);
+            // Close: fill gaps within pills
+            cv.morphologyEx(binary, binary, cv.MORPH_CLOSE, kernel);
             kernel.delete();
 
-            // Connected components with stats
-            const numLabels = cv.connectedComponentsWithStats(binary, labels, stats, centroids);
+            // Find contours
+            const contours = new cv.MatVector();
+            const hierarchy = new cv.Mat();
+            cv.findContours(binary, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+            // Size thresholds based on image
+            // A pill should be at least ~1% of minDim in radius → area ≥ (minDim*0.01)^2 * π
+            const pillMinRadius = minDim * 0.012;
+            const pillMaxRadius = minDim * 0.06;
+            const minArea = Math.PI * pillMinRadius * pillMinRadius;  // ~450px for 1080p
+            const maxArea = Math.PI * pillMaxRadius * pillMaxRadius;  // ~11000px for 1080p
 
             const boxes: BoundingBox[] = [];
-            const minDim = Math.min(W, H);
-            const minArea = (minDim * 0.005) ** 2;   // ~0.5% of min dimension squared
-            const maxArea = (minDim * 0.06) ** 2;     // ~6% of min dimension squared
 
-            for (let i = 1; i < numLabels; i++) { // skip background (label 0)
-                const x = stats.intAt(i, cv.CC_STAT_LEFT);
-                const y = stats.intAt(i, cv.CC_STAT_TOP);
-                const w = stats.intAt(i, cv.CC_STAT_WIDTH);
-                const h = stats.intAt(i, cv.CC_STAT_HEIGHT);
-                const area = stats.intAt(i, cv.CC_STAT_AREA);
+            for (let i = 0; i < contours.size(); i++) {
+                const contour = contours.get(i);
+                const area = cv.contourArea(contour);
 
                 // Size filter
                 if (area < minArea || area > maxArea) continue;
 
-                // Aspect ratio filter — pills are roughly round/oval
-                const aspect = Math.max(w, h) / Math.min(w, h);
-                if (aspect > 2.5) continue;
+                // Circularity filter — this is KEY
+                // circularity = 4π * area / perimeter² (1.0 = perfect circle)
+                const perimeter = cv.arcLength(contour, true);
+                if (perimeter === 0) continue;
+                const circularity = (4 * Math.PI * area) / (perimeter * perimeter);
 
-                // Solidity check — area vs bounding box area
-                const solidity = area / (w * h);
-                if (solidity < 0.3) continue;
+                // Pills should be fairly round (circle≈1.0, square≈0.78)
+                // Text characters are typically < 0.3
+                if (circularity < 0.45) continue;
+
+                // Bounding rect
+                const rect = cv.boundingRect(contour);
+
+                // Aspect ratio filter — pills are round/oval, not elongated
+                const aspect = Math.max(rect.width, rect.height) / Math.min(rect.width, rect.height);
+                if (aspect > 2.0) continue;
 
                 // Brightness check — pills should be bright
-                const roiX = Math.max(0, x);
-                const roiY = Math.max(0, y);
-                const roiW = Math.min(w, W - roiX);
-                const roiH = Math.min(h, H - roiY);
-                if (roiW <= 0 || roiH <= 0) continue;
+                const roiGray = gray.roi(new cv.Rect(rect.x, rect.y, rect.width, rect.height));
+                const meanBright = cv.mean(roiGray);
+                roiGray.delete();
+                if (meanBright[0] < 120) continue;
 
-                const roi = gray.roi(new cv.Rect(roiX, roiY, roiW, roiH));
-                const meanBright = cv.mean(roi);
-                roi.delete();
-                if (meanBright[0] < 100) continue;
-
-                // Color classification
-                const colorRoi = hsv.roi(new cv.Rect(roiX, roiY, roiW, roiH));
-                const colorMean = cv.mean(colorRoi);
-                colorRoi.delete();
+                // Color classification from HSV
+                const roiHsv = hsv.roi(new cv.Rect(rect.x, rect.y, rect.width, rect.height));
+                const colorMean = cv.mean(roiHsv);
+                roiHsv.delete();
                 const label = this.classifyColor(colorMean[0], colorMean[1]);
 
+                const conf = Math.min(0.99, 0.7 + circularity * 0.2 + (meanBright[0] / 255) * 0.1);
+
                 boxes.push({
-                    x: (x + w / 2) / W,
-                    y: (y + h / 2) / H,
-                    w: w / W,
-                    h: h / H,
-                    confidence: Math.min(0.99, 0.75 + solidity * 0.2 + (meanBright[0] / 255) * 0.05),
+                    x: (rect.x + rect.width / 2) / W,
+                    y: (rect.y + rect.height / 2) / H,
+                    w: rect.width / W,
+                    h: rect.height / H,
+                    confidence: conf,
                     label
                 });
             }
 
+            contours.delete();
+            hierarchy.delete();
             return boxes;
 
         } finally {
             gray.delete();
             binary.delete();
-            labels.delete();
-            stats.delete();
-            centroids.delete();
             hsv.delete();
         }
     }
 
     /**
-     * Strategy 2: HoughCircles with relaxed parameters
+     * HoughCircles backup — finds well-defined circles
      */
     private static detectByCircles(cv: any, src: any, W: number, H: number): BoundingBox[] {
         const gray = new cv.Mat();
@@ -180,20 +169,16 @@ export class PillDetector {
 
         try {
             cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-            const ksize = Math.max(5, Math.round(Math.min(W, H) * 0.006) | 1);
-            cv.GaussianBlur(gray, blurred, new cv.Size(ksize, ksize), 1.5);
+            cv.GaussianBlur(gray, blurred, new cv.Size(7, 7), 2);
 
             const minDim = Math.min(W, H);
-            const minRadius = Math.max(3, Math.round(minDim * 0.006));
-            const maxRadius = Math.round(minDim * 0.05);
-            const minDist = minRadius * 1.8;
+            const minR = Math.max(5, Math.round(minDim * 0.012));
+            const maxR = Math.round(minDim * 0.06);
 
-            cv.HoughCircles(
-                blurred, circles, cv.HOUGH_GRADIENT,
-                1, minDist,
-                60,     // param1 — lower Canny threshold for more edges
-                18,     // param2 — lower accumulator threshold for more detections
-                minRadius, maxRadius
+            cv.HoughCircles(blurred, circles, cv.HOUGH_GRADIENT,
+                1, minR * 2,
+                80, 25,
+                minR, maxR
             );
 
             const boxes: BoundingBox[] = [];
@@ -203,27 +188,25 @@ export class PillDetector {
                 const r = circles.data32F[i * 3 + 2];
 
                 // Brightness check
-                const roiX = Math.max(0, Math.round(cx - r));
-                const roiY = Math.max(0, Math.round(cy - r));
-                const roiW = Math.min(Math.round(r * 2), W - roiX);
-                const roiH = Math.min(Math.round(r * 2), H - roiY);
-                if (roiW <= 0 || roiH <= 0) continue;
+                const rx = Math.max(0, Math.round(cx - r));
+                const ry = Math.max(0, Math.round(cy - r));
+                const rw = Math.min(Math.round(r * 2), W - rx);
+                const rh = Math.min(Math.round(r * 2), H - ry);
+                if (rw <= 0 || rh <= 0) continue;
 
-                const roi = gray.roi(new cv.Rect(roiX, roiY, roiW, roiH));
-                const meanVal = cv.mean(roi);
+                const roi = gray.roi(new cv.Rect(rx, ry, rw, rh));
+                const m = cv.mean(roi);
                 roi.delete();
-                if (meanVal[0] < 100) continue;
+                if (m[0] < 120) continue;
 
                 const d = r * 2;
                 boxes.push({
-                    x: cx / W, y: cy / H,
-                    w: d / W, h: d / H,
-                    confidence: Math.min(0.99, 0.80 + (meanVal[0] / 255) * 0.15),
+                    x: cx / W, y: cy / H, w: d / W, h: d / H,
+                    confidence: Math.min(0.99, 0.80 + (m[0] / 255) * 0.15),
                     label: '알약'
                 });
             }
             return boxes;
-
         } finally {
             gray.delete();
             blurred.delete();
@@ -232,36 +215,22 @@ export class PillDetector {
     }
 
     /**
-     * Group detected pills into bags using gap-based clustering on x-coordinates
+     * Group pills into bags by gap-based x-coordinate clustering
      */
     static clusterIntoBags(boxes: BoundingBox[]): BoundingBox[][] {
         if (boxes.length === 0) return [];
-
-        // Sort by x coordinate
         const sorted = [...boxes].sort((a, b) => a.x - b.x);
 
-        // Find natural gaps in x-coordinates
-        const gaps: { idx: number, gap: number }[] = [];
-        for (let i = 1; i < sorted.length; i++) {
-            gaps.push({ idx: i, gap: sorted[i].x - sorted[i - 1].x });
-        }
-
-        // Average pill width as reference for gap threshold
         const avgWidth = sorted.reduce((s, b) => s + b.w, 0) / sorted.length;
-        const gapThreshold = Math.max(avgWidth * 2.5, 0.03); // at least 3% gap or 2.5x pill width
+        const gapThreshold = Math.max(avgWidth * 2.5, 0.03);
 
-        // Split into clusters at significant gaps
-        const clusters: BoundingBox[][] = [[]];
-        clusters[0].push(sorted[0]);
-
+        const clusters: BoundingBox[][] = [[sorted[0]]];
         for (let i = 1; i < sorted.length; i++) {
-            const gap = sorted[i].x - sorted[i - 1].x;
-            if (gap > gapThreshold) {
+            if (sorted[i].x - sorted[i - 1].x > gapThreshold) {
                 clusters.push([]);
             }
             clusters[clusters.length - 1].push(sorted[i]);
         }
-
         return clusters;
     }
 
@@ -273,25 +242,19 @@ export class PillDetector {
         return '알약';
     }
 
-    private static nonMaxSuppression(boxes: BoundingBox[], iouThreshold: number): BoundingBox[] {
+    private static nms(boxes: BoundingBox[], threshold: number): BoundingBox[] {
         const sorted = [...boxes].sort((a, b) => b.confidence - a.confidence);
         const kept: BoundingBox[] = [];
         for (const box of sorted) {
-            if (!kept.some(e => this.iou(box, e) > iouThreshold)) {
-                kept.push(box);
-            }
+            if (!kept.some(e => this.iou(box, e) > threshold)) kept.push(box);
         }
         return kept;
     }
 
     private static iou(a: BoundingBox, b: BoundingBox): number {
-        const ax1 = a.x - a.w / 2, ay1 = a.y - a.h / 2;
-        const ax2 = a.x + a.w / 2, ay2 = a.y + a.h / 2;
-        const bx1 = b.x - b.w / 2, by1 = b.y - b.h / 2;
-        const bx2 = b.x + b.w / 2, by2 = b.y + b.h / 2;
-        const ix1 = Math.max(ax1, bx1), iy1 = Math.max(ay1, by1);
-        const ix2 = Math.min(ax2, bx2), iy2 = Math.min(ay2, by2);
-        const inter = Math.max(0, ix2 - ix1) * Math.max(0, iy2 - iy1);
+        const ax1 = a.x - a.w / 2, ay1 = a.y - a.h / 2, ax2 = a.x + a.w / 2, ay2 = a.y + a.h / 2;
+        const bx1 = b.x - b.w / 2, by1 = b.y - b.h / 2, bx2 = b.x + b.w / 2, by2 = b.y + b.h / 2;
+        const inter = Math.max(0, Math.min(ax2, bx2) - Math.max(ax1, bx1)) * Math.max(0, Math.min(ay2, by2) - Math.max(ay1, by1));
         const union = a.w * a.h + b.w * b.h - inter;
         return union > 0 ? inter / union : 0;
     }
