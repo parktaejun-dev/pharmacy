@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useState } from 'react';
+import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { BatchProcessingResult, BoundingBox } from '../services/Metrics';
 
 interface ResultPanelProps {
@@ -7,49 +7,75 @@ interface ResultPanelProps {
     expectedCount: number;
 }
 
-// Draw bounding boxes on a canvas overlay
-const BBoxCanvas: React.FC<{ boxes: BoundingBox[], width: number, height: number, selectedBag: number | null }> = ({ boxes, width, height, selectedBag }) => {
+// Draw bounding boxes on a canvas that auto-sizes to the image
+const BBoxOverlay: React.FC<{ boxes: BoundingBox[], containerRef: React.RefObject<HTMLDivElement | null> }> = ({ boxes, containerRef }) => {
     const canvasRef = useRef<HTMLCanvasElement>(null);
 
-    useEffect(() => {
+    const draw = useCallback(() => {
         const canvas = canvasRef.current;
-        if (!canvas) return;
+        const container = containerRef.current;
+        if (!canvas || !container) return;
+
+        const img = container.querySelector('img');
+        if (!img) return;
+
+        // Match canvas to the displayed image size
+        const rect = img.getBoundingClientRect();
+        const contRect = container.getBoundingClientRect();
+        canvas.width = rect.width;
+        canvas.height = rect.height;
+        canvas.style.left = `${rect.left - contRect.left}px`;
+        canvas.style.top = `${rect.top - contRect.top}px`;
+
         const ctx = canvas.getContext('2d');
         if (!ctx) return;
-
-        canvas.width = width;
-        canvas.height = height;
-        ctx.clearRect(0, 0, width, height);
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
 
         boxes.forEach(box => {
-            const bx = (box.x - box.w / 2) * width;
-            const by = (box.y - box.h / 2) * height;
-            const bw = box.w * width;
-            const bh = box.h * height;
+            const bx = (box.x - box.w / 2) * canvas.width;
+            const by = (box.y - box.h / 2) * canvas.height;
+            const bw = box.w * canvas.width;
+            const bh = box.h * canvas.height;
 
             // Color by confidence
             const color = box.confidence > 0.95 ? '#10b981' : box.confidence > 0.85 ? '#f59e0b' : '#ef4444';
 
+            // Draw filled background
+            ctx.fillStyle = color + '20';
+            ctx.fillRect(bx, by, bw, bh);
+
+            // Draw border
             ctx.strokeStyle = color;
             ctx.lineWidth = 2;
             ctx.strokeRect(bx, by, bw, bh);
 
             // Confidence label
+            const labelText = `${(box.confidence * 100).toFixed(0)}%`;
+            ctx.font = 'bold 9px sans-serif';
+            const tw = ctx.measureText(labelText).width + 6;
             ctx.fillStyle = color;
-            ctx.fillRect(bx, by - 14, 36, 14);
+            ctx.fillRect(bx, by - 13, tw, 13);
             ctx.fillStyle = '#fff';
-            ctx.font = '10px sans-serif';
-            ctx.fillText(`${(box.confidence * 100).toFixed(0)}%`, bx + 2, by - 3);
+            ctx.fillText(labelText, bx + 3, by - 3);
         });
-    }, [boxes, width, height, selectedBag]);
+    }, [boxes, containerRef]);
 
-    return <canvas ref={canvasRef} style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', pointerEvents: 'none' }} />;
+    useEffect(() => {
+        draw();
+        window.addEventListener('resize', draw);
+        // Redraw after a short delay to account for image load/layout
+        const timer = setTimeout(draw, 200);
+        return () => { window.removeEventListener('resize', draw); clearTimeout(timer); };
+    }, [draw]);
+
+    return <canvas ref={canvasRef} style={{ position: 'absolute', pointerEvents: 'none' }} />;
 };
 
 export const ResultPanel: React.FC<ResultPanelProps> = ({ result, onRescan, expectedCount }) => {
     const allPass = result.results.every(r => r.boxCount === expectedCount);
     const failCount = result.results.filter(r => r.boxCount !== expectedCount).length;
     const [selectedBag, setSelectedBag] = useState<number | null>(null);
+    const imageContainerRef = useRef<HTMLDivElement>(null);
 
     // Gather all boxes or just selected bag's boxes
     const visibleBoxes: BoundingBox[] = selectedBag !== null
@@ -66,12 +92,9 @@ export const ResultPanel: React.FC<ResultPanelProps> = ({ result, onRescan, expe
                 {/* Big result banner */}
                 <div className="glass-panel" style={{
                     padding: '10px 16px',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'space-between',
+                    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
                     borderColor: allPass ? 'var(--accent-green)' : 'var(--accent-red)',
-                    borderWidth: '2px',
-                    flexShrink: 0
+                    borderWidth: '2px', flexShrink: 0
                 }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                         <span style={{ fontSize: '1.5rem' }}>{allPass ? '✅' : '❌'}</span>
@@ -92,28 +115,24 @@ export const ResultPanel: React.FC<ResultPanelProps> = ({ result, onRescan, expe
                 </div>
 
                 {/* Annotated image with bounding boxes */}
-                <div style={{ flex: 1, position: 'relative', borderRadius: '12px', overflow: 'hidden', background: '#111', minHeight: 0 }}>
-                    <img src={bgImage} alt="검수 결과" style={{ width: '100%', height: '100%', objectFit: 'contain' }} />
-                    <BBoxCanvas boxes={visibleBoxes} width={1024} height={512} selectedBag={selectedBag} />
+                <div ref={imageContainerRef} style={{ flex: 1, position: 'relative', borderRadius: '12px', overflow: 'hidden', background: '#111', minHeight: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <img src={bgImage} alt="검수 결과" style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />
+                    <BBoxOverlay boxes={visibleBoxes} containerRef={imageContainerRef} />
                     <div style={{
                         position: 'absolute', bottom: '4px', left: '4px',
-                        background: 'rgba(0,0,0,0.7)', padding: '3px 8px', borderRadius: '6px',
+                        background: 'rgba(0,0,0,0.8)', padding: '3px 8px', borderRadius: '6px',
                         fontSize: '0.65rem', color: 'var(--text-secondary)'
                     }}>
-                        {selectedBag !== null ? `${selectedBag + 1}번 봉지 ({visibleBoxes.length}알 감지)` : `전체 ${visibleBoxes.length}알 감지`}
-                        {selectedBag !== null && (
-                            <button onClick={() => setSelectedBag(null)}
-                                style={{ marginLeft: '8px', background: 'none', border: 'none', color: 'var(--accent-blue)', cursor: 'pointer', fontSize: '0.65rem' }}>
-                                전체보기
-                            </button>
-                        )}
+                        {selectedBag !== null
+                            ? <>{selectedBag + 1}번 봉지 ({visibleBoxes.length}알 감지) <button onClick={() => setSelectedBag(null)} style={{ marginLeft: '6px', background: 'none', border: 'none', color: 'var(--accent-blue)', cursor: 'pointer', fontSize: '0.65rem' }}>전체보기</button></>
+                            : <>전체 {visibleBoxes.length}알 감지</>
+                        }
                     </div>
                 </div>
             </div>
 
             {/* Right: Bag grid + Metrics + Actions */}
             <div className="result-right">
-                {/* Bag grid — vertical for right panel */}
                 <div className="glass-panel" style={{ padding: '8px', flex: 1, overflow: 'auto' }}>
                     <h4 style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: '6px', textAlign: 'center' }}>봉지별 결과</h4>
                     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: '3px' }}>
@@ -121,8 +140,7 @@ export const ResultPanel: React.FC<ResultPanelProps> = ({ result, onRescan, expe
                             const isPass = r.boxCount === expectedCount;
                             const isSelected = selectedBag === i;
                             return (
-                                <div key={i}
-                                    onClick={() => setSelectedBag(isSelected ? null : i)}
+                                <div key={i} onClick={() => setSelectedBag(isSelected ? null : i)}
                                     style={{
                                         display: 'flex', flexDirection: 'column', alignItems: 'center',
                                         justifyContent: 'center', padding: '4px 2px', borderRadius: '6px',
@@ -141,7 +159,6 @@ export const ResultPanel: React.FC<ResultPanelProps> = ({ result, onRescan, expe
                     </div>
                 </div>
 
-                {/* Performance */}
                 <div className="glass-panel" style={{ padding: '8px' }}>
                     <h4 style={{ color: 'var(--text-secondary)', marginBottom: '4px', fontSize: '0.7rem' }}>⏱ 처리성능</h4>
                     <div style={{ fontSize: '0.75rem', display: 'flex', flexDirection: 'column', gap: '2px' }}>
