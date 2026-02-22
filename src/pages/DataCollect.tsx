@@ -1,4 +1,5 @@
 import React, { useState, useRef, useCallback } from 'react';
+import JSZip from 'jszip';
 
 interface CollectedSample {
     id: string;
@@ -107,30 +108,54 @@ export const DataCollect: React.FC = () => {
         saveSamples(updated);
     };
 
-    const exportData = () => {
-        const exportObj = {
-            version: '1.0',
-            exportDate: new Date().toISOString(),
-            totalSamples: samples.length,
-            normalCount: samples.filter(s => s.label === '정상').length,
-            abnormalCount: samples.filter(s => s.label === '이상').length,
-            samples: samples.map(s => ({
-                id: s.id,
-                label: s.label,
-                pillCount: s.pillCount,
-                bagCount: s.bagCount,
-                note: s.note,
-                timestamp: s.timestamp,
-                imageSize: s.imageDataUrl.length
-            }))
-        };
-        const blob = new Blob([JSON.stringify(exportObj, null, 2)], { type: 'application/json' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `pill_dataset_${new Date().toISOString().slice(0, 10)}.json`;
-        a.click();
-        URL.revokeObjectURL(url);
+    const exportData = async () => {
+        try {
+            const zip = new JSZip();
+            const root = zip.folder(`pill_dataset_${new Date().toISOString().slice(0, 10)}`);
+            if (!root) throw new Error("Could not create zip folder");
+
+            const imagesFolder = root.folder('images');
+
+            const exportObj = {
+                version: '1.0',
+                exportDate: new Date().toISOString(),
+                totalSamples: samples.length,
+                normalCount: samples.filter(s => s.label === '정상').length,
+                abnormalCount: samples.filter(s => s.label === '이상').length,
+                samples: samples.map(s => {
+                    const filename = `${s.id}_${s.label}_${s.pillCount}x${s.bagCount}.jpg`.replace(/[^a-zA-Z0-9_.-]/g, '_');
+
+                    // Add image to zip
+                    if (imagesFolder && s.imageDataUrl.startsWith('data:image')) {
+                        const base64Data = s.imageDataUrl.split(',')[1];
+                        imagesFolder.file(filename, base64Data, { base64: true });
+                    }
+
+                    return {
+                        id: s.id,
+                        filename,
+                        label: s.label,
+                        expectedPillsPerBag: s.pillCount,
+                        bagCount: s.bagCount,
+                        note: s.note,
+                        timestamp: s.timestamp
+                    };
+                })
+            };
+
+            root.file('manifest.json', JSON.stringify(exportObj, null, 2));
+
+            const blob = await zip.generateAsync({ type: 'blob' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `pharmacy_dataset_${new Date().toISOString().slice(0, 10)}.zip`;
+            a.click();
+            URL.revokeObjectURL(url);
+        } catch (e) {
+            console.error("Export failed", e);
+            alert("데이터 내보내기 실패");
+        }
     };
 
     const normalCount = samples.filter(s => s.label === '정상').length;
@@ -139,12 +164,12 @@ export const DataCollect: React.FC = () => {
     // Camera capture view
     if (showCamera) {
         return (
-            <div style={{ height: '100%', display: 'flex', flexDirection: 'column', background: '#000' }}>
+            <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 9999, background: '#000', display: 'flex', flexDirection: 'column' }}>
                 <video ref={videoRef} playsInline autoPlay muted
-                    style={{ flex: 1, objectFit: 'cover', width: '100%' }} />
-                <div style={{ display: 'flex', gap: '12px', justifyContent: 'center', padding: '12px', background: 'rgba(0,0,0,0.8)' }}>
-                    <button className="btn" style={{ background: 'var(--panel-bg)' }} onClick={stopCamera}>취소</button>
-                    <button className="btn scan-btn" onClick={capturePhoto}>📸 촬영</button>
+                    style={{ flex: 1, objectFit: 'cover', width: '100%', minHeight: 0 }} />
+                <div style={{ position: 'absolute', bottom: '30px', left: 0, right: 0, display: 'flex', gap: '16px', justifyContent: 'center', padding: '16px' }}>
+                    <button className="btn" style={{ background: 'rgba(255,255,255,0.2)', backdropFilter: 'blur(10px)', color: 'white', padding: '16px 32px', borderRadius: '30px', fontWeight: 'bold' }} onClick={stopCamera}>취소 (Cancel)</button>
+                    <button className="btn scan-btn" style={{ padding: '16px 48px', borderRadius: '30px', fontSize: '1.2rem', boxShadow: '0 4px 15px rgba(59, 130, 246, 0.5)' }} onClick={capturePhoto}>📸 촬영 (Capture)</button>
                 </div>
             </div>
         );
@@ -339,7 +364,7 @@ export const DataCollect: React.FC = () => {
                 {samples.length > 0 && (
                     <button className="btn" style={{ flex: 1, background: 'var(--panel-bg)' }}
                         onClick={exportData}>
-                        📤 데이터 내보내기 (JSON)
+                        📦 ZIP 내보내기 ({samples.length}장)
                     </button>
                 )}
             </div>

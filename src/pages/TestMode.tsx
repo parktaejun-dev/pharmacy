@@ -1,7 +1,8 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { PillDetector } from '../services/PillDetector';
-import { BatchProcessingResult, PipelineMetrics, InferenceResult } from '../services/Metrics';
+import { BatchProcessingResult } from '../services/Metrics';
 import { ResultPanel } from '../components/ResultPanel';
+import { MvpInferenceService } from '../services/Inference';
+import { ComputerVision } from '../services/ComputerVision';
 
 interface TestSample {
     id: string;
@@ -13,10 +14,10 @@ interface TestSample {
 
 const TEST_SAMPLES: TestSample[] = [
     {
-        id: 'normal_5',
-        name: '정상 세트 (5알×10봉지)',
-        imageUrl: '/testset/normal_5pills.png',
-        description: '10봉지 모두 5알씩 정상 포장',
+        id: 'normal_6',
+        name: '정상 세트 (6알×10봉지)',
+        imageUrl: '/testset/normal_5pills.png', // The file name says 5 but the image contains 6
+        description: '10봉지 모두 6알씩 정상 포장',
         label: '정상'
     },
     {
@@ -32,60 +33,88 @@ export const TestMode: React.FC = () => {
     const [selectedSample, setSelectedSample] = useState<TestSample | null>(null);
     const [isRunning, setIsRunning] = useState(false);
     const [result, setResult] = useState<BatchProcessingResult | null>(null);
-    const [detectionLog, setDetectionLog] = useState<string>('');
+    const [isEngineReady, setIsEngineReady] = useState(false);
+    const [croppedImageUrl, setCroppedImageUrl] = useState<string | null>(null);
     const imgRef = useRef<HTMLImageElement>(null);
 
     const runTest = (sample: TestSample) => {
         setSelectedSample(sample);
         setIsRunning(true);
         setResult(null);
-        setDetectionLog('이미지 로딩 중...');
     };
 
     useEffect(() => {
-        if (!isRunning || !selectedSample || !imgRef.current) return;
+        // Initialize the ONNX session
+        MvpInferenceService.init().then(() => {
+            setIsEngineReady(true);
+        }).catch(console.error);
+    }, []);
+
+    useEffect(() => {
+        if (!isRunning || !selectedSample || !imgRef.current || !isEngineReady) return;
 
         const img = imgRef.current;
-        const handleLoad = () => {
-            setDetectionLog('OpenCV 감지 실행 중...');
-            const startTime = performance.now();
+        const handleLoad = async () => {
+            const canvas = document.createElement('canvas');
+            canvas.width = img.naturalWidth;
+            canvas.height = img.naturalHeight;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) {
+                setIsRunning(false);
+                return;
+            }
+            // Draw the image first so OpenCV can analyze the pixels
+            ctx.fillStyle = '#C0C0C0'; // Neutral background for transparent PNGs
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(img, 0, 0);
 
-            // Real OpenCV detection
-            const allBoxes = PillDetector.detectFromImage(img);
-            const inferEnd = performance.now();
+            // Dynamically detect the pill bag region
+            let cropX = 0, cropY = 0, cropW = canvas.width, cropH = canvas.height;
+            const roi = ComputerVision.findPillBagRegion(canvas);
 
-            // Cluster into bags by x-coordinate gaps
-            const clusters = PillDetector.clusterIntoBags(allBoxes);
+            if (roi) {
+                cropX = roi.x;
+                cropY = roi.y;
+                cropW = roi.w;
+                cropH = roi.h;
+            } else {
+                // Fallback
+                cropW = canvas.width * 0.95;
+                cropH = canvas.height * 0.65;
+                cropX = (canvas.width - cropW) / 2;
+                cropY = (canvas.height - cropH) / 2;
+            }
 
-            // Auto-detect expected count = mode (most common count)
-            const counts = clusters.map(c => c.length);
-            const freq: Record<number, number> = {};
-            counts.forEach(c => freq[c] = (freq[c] || 0) + 1);
-            const autoExpected = Object.entries(freq).sort((a, b) => Number(b[1]) - Number(a[1]))[0]?.[0];
-            const expectedPerBag = autoExpected ? parseInt(autoExpected) : 0;
+            const croppedCanvas = document.createElement('canvas');
+            croppedCanvas.width = cropW;
+            croppedCanvas.height = cropH;
+            const ctx2 = croppedCanvas.getContext('2d');
 
-            const bagResults: InferenceResult[] = clusters.map(bagBoxes => ({
-                boxCount: bagBoxes.length,
-                confidenceAverage: bagBoxes.length > 0 ? bagBoxes.reduce((s, b) => s + b.confidence, 0) / bagBoxes.length : 0,
-                passedExpectedCount: bagBoxes.length === expectedPerBag,
-                boxes: bagBoxes
-            }));
+            if (!ctx2) {
+                setIsRunning(false);
+                return;
+            }
 
-            const overallPass = bagResults.length > 0 && bagResults.every(r => r.passedExpectedCount);
-            const renderEnd = performance.now();
+            // Fill neutral background for final cropped image fed to YOLO
+            ctx2.fillStyle = '#C0C0C0';
+            ctx2.fillRect(0, 0, cropW, cropH);
+            ctx2.drawImage(canvas, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
 
-            setDetectionLog(`${allBoxes.length}개 알약 → ${clusters.length}봉지 (기대 ${expectedPerBag}알/봉, ${(inferEnd - startTime).toFixed(0)}ms)`);
+            setCroppedImageUrl(croppedCanvas.toDataURL('image/jpeg', 0.9));
 
-            const metrics: PipelineMetrics = {
-                captureMs: 0, warpMs: 0,
-                inferMs: inferEnd - startTime,
-                postprocessMs: renderEnd - inferEnd,
-                renderMs: 1,
-                totalMs: renderEnd - startTime
-            };
+            // Yield the event loop slightly to ensure React paints the loading overlay before aggressive WASM block
+            setTimeout(async () => {
+                try {
+                    const yoloResult = await MvpInferenceService.runTrackBYolo(croppedCanvas);
+                    const numBags = yoloResult.results.length;
+                    console.log(`Detected pills across ${numBags} bags.`);
 
-            setResult({ results: bagResults, metrics, overallPass, expectedPerBag });
-            setIsRunning(false);
+                    setResult(yoloResult);
+                } catch (err) {
+                    console.error("YOLO Inference failed", err);
+                }
+                setIsRunning(false);
+            }, 100);
         };
 
         if (img.complete && img.naturalWidth > 0) {
@@ -93,7 +122,7 @@ export const TestMode: React.FC = () => {
         } else {
             img.onload = handleLoad;
         }
-    }, [isRunning, selectedSample]);
+    }, [isRunning, selectedSample, isEngineReady]);
 
     if (result && selectedSample) {
         return (
@@ -102,7 +131,7 @@ export const TestMode: React.FC = () => {
                     <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
                         테스트: <strong style={{ color: 'var(--text-primary)' }}>{selectedSample.name}</strong>
                         <span style={{ marginLeft: '8px', fontSize: '0.75rem', color: 'var(--accent-blue)' }}>
-                            (OpenCV 실제 감지)
+                            (YOLOv8 AI 활성화됨)
                         </span>
                     </span>
                     <button className="btn" style={{ padding: '4px 12px', fontSize: '0.8rem', background: 'var(--panel-bg)' }}
@@ -114,8 +143,8 @@ export const TestMode: React.FC = () => {
                     <ResultPanel
                         result={result}
                         expectedCount={result.expectedPerBag || 0}
-                        imageUrl={selectedSample.imageUrl}
-                        onRescan={() => { setResult(null); setSelectedSample(null); }}
+                        imageUrl={croppedImageUrl || selectedSample.imageUrl}
+                        onRescan={() => { setResult(null); setSelectedSample(null); setCroppedImageUrl(null); }}
                     />
                 </div>
             </div>
@@ -127,21 +156,41 @@ export const TestMode: React.FC = () => {
             <div style={{ marginBottom: '16px' }}>
                 <h2 style={{ fontSize: '1.1rem', marginBottom: '4px' }}>🧪 테스트 모드</h2>
                 <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
-                    OpenCV.js로 테스트 이미지에서 <strong>실제 알약을 감지</strong>합니다
+                    ONNX Runtime과 AI 모델(YOLOv8)로 비전 검수를 <strong>실시간 수행</strong>합니다
                 </p>
             </div>
 
             {isRunning && (
-                <>
+                <div style={{
+                    position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh',
+                    backgroundColor: 'rgba(0, 0, 0, 0.8)', zIndex: 9999,
+                    display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center'
+                }}>
                     <img ref={imgRef} src={selectedSample?.imageUrl}
                         crossOrigin="anonymous"
                         style={{ position: 'absolute', opacity: 0, pointerEvents: 'none' }}
                         alt="detection source" />
-                    <div style={{ textAlign: 'center', padding: '40px', color: 'var(--accent-blue)' }}>
-                        <div style={{ fontSize: '1.2rem', marginBottom: '8px' }}>🔍 감지 중...</div>
-                        <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>{detectionLog}</div>
+
+                    <div style={{
+                        width: '60px', height: '60px', borderRadius: '50%',
+                        border: '4px solid rgba(255,255,255,0.1)',
+                        borderTopColor: 'var(--accent-blue)',
+                        animation: 'spin 1s linear infinite',
+                        marginBottom: '20px'
+                    }} />
+
+                    <div style={{ fontSize: '1.4rem', fontWeight: 'bold', color: 'white', marginBottom: '8px' }}>
+                        {!isEngineReady ? '⏳ AI 엔진 로딩 및 워밍업 중...' : '🔍 고해상도 비전 추론 중...'}
                     </div>
-                </>
+                    <div style={{ fontSize: '0.9rem', color: '#aaa', textAlign: 'center', maxWidth: '300px' }}>
+                        {!isEngineReady
+                            ? '첫 실행 시 모델 다운로드(42MB) 및 물리 메모리 할당으로 최대 30초가 소요될 수 있습니다.'
+                            : '글로벌 초정밀 AI 모델이 구동 중입니다. 기기 성능에 따라 15~30초가 소요됩니다.'}
+                    </div>
+                    <style>{`
+                        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+                    `}</style>
+                </div>
             )}
 
             {!isRunning && (

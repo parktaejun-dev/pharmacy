@@ -65,7 +65,7 @@ export const CameraView: React.FC<CameraViewProps> = ({ onFrameReady, isActive, 
         const canvas = canvasRef.current;
 
         if (video.readyState === video.HAVE_ENOUGH_DATA) {
-            // Setup canvas dimensions to match video stream layout
+            // Give the AI the *full* hardware frame to let Inference.ts pad it properly
             if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
                 canvas.width = video.videoWidth;
                 canvas.height = video.videoHeight;
@@ -73,10 +73,10 @@ export const CameraView: React.FC<CameraViewProps> = ({ onFrameReady, isActive, 
 
             const ctx = canvas.getContext('2d', { willReadFrequently: true });
             if (ctx) {
-                // Draw frame to internal canvas
+                // Draw the entire raw frame
                 ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-                // Let the parent / QualityGate logic analyze the frame using OpenCV
+                // Pass the full frame to Inference.ts
                 onFrameReady(canvas);
             }
         }
@@ -140,7 +140,7 @@ export const CameraView: React.FC<CameraViewProps> = ({ onFrameReady, isActive, 
                 pointerEvents: 'none'
             }}>
                 <div style={{ position: 'absolute', top: '-24px', width: '100%', textAlign: 'center', color: 'rgba(255,255,255,0.8)', fontSize: '0.8rem' }}>
-                    Align the 10-cell mat inside this box
+                    약봉지 전체가 화면에 들어오게 찍어주세요
                 </div>
             </div>
         </div>

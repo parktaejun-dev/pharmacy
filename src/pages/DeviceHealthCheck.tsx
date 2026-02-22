@@ -69,11 +69,7 @@ export const DeviceHealthCheck: React.FC = () => {
         setInferenceStatus('⏳ Loading dummy model and executing...');
         const start = performance.now();
         try {
-            const initSuccess = await inferenceSvc.initializeSession('/models/dummy.onnx');
-            if (!initSuccess) {
-                setInferenceStatus('❌ Failed to initialize dummy ORT session.');
-                return;
-            }
+            await inferenceSvc.init();
 
             // Create dummy input tensor to satisfy the dummy.onnx model signature [1, 3, 224, 224]
             const dummyData = new Float32Array(1 * 3 * 224 * 224);

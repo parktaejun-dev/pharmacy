@@ -25,10 +25,30 @@ const BBoxOverlay: React.FC<{
 
         const rect = img.getBoundingClientRect();
         const contRect = container.getBoundingClientRect();
-        canvas.width = rect.width;
-        canvas.height = rect.height;
-        canvas.style.left = `${rect.left - contRect.left}px`;
-        canvas.style.top = `${rect.top - contRect.top}px`;
+
+        let renderWidth = rect.width;
+        let renderHeight = rect.height;
+
+        if (img.naturalWidth && img.naturalHeight) {
+            const imgRatio = img.naturalWidth / img.naturalHeight;
+            const contRatio = rect.width / rect.height;
+
+            if (imgRatio > contRatio) {
+                // Image is wider than container, so it's letterboxed (padding on top/bottom)
+                renderHeight = rect.width / imgRatio;
+            } else {
+                // Image is taller, so it's pillarboxed (padding on left/right)
+                renderWidth = rect.height * imgRatio;
+            }
+        }
+
+        const offsetX = (rect.width - renderWidth) / 2;
+        const offsetY = (rect.height - renderHeight) / 2;
+
+        canvas.width = renderWidth;
+        canvas.height = renderHeight;
+        canvas.style.left = `${rect.left - contRect.left + offsetX}px`;
+        canvas.style.top = `${rect.top - contRect.top + offsetY}px`;
 
         const ctx = canvas.getContext('2d');
         if (!ctx) return;
@@ -155,6 +175,9 @@ export const ResultPanel: React.FC<ResultPanelProps> = ({ result, onRescan, expe
                 color: 'rgba(255,255,255,0.7)', zIndex: 11
             }}>
                 촬영 {result.metrics.captureMs.toFixed(0)}ms · 추론 {result.metrics.inferMs.toFixed(0)}ms · 합계 <b style={{ color: '#fff' }}>{result.metrics.totalMs.toFixed(0)}ms</b>
+                {result.metrics.debugStr && (
+                    <div style={{ marginTop: '2px', color: 'var(--accent-blue)', fontSize: '0.55rem' }}>{result.metrics.debugStr}</div>
+                )}
             </div>
         </div>
     );

@@ -1,111 +1,320 @@
-import * as ort from 'onnxruntime-web/webgpu';
-import { BatchProcessingResult, PipelineMetrics } from './Metrics';
+import * as ort from 'onnxruntime-web';
+import { BatchProcessingResult, BoundingBox, PipelineMetrics } from './Metrics';
+import { PillDetector } from './PillDetector';
 
-// Mandated configuration constraint
-ort.env.wasm.wasmPaths = '/ort-wasm/';
+ort.env.wasm.numThreads = navigator.hardwareConcurrency || 4;
+ort.env.wasm.simd = true;
+// Force absolute URL to ensure worker resolves it against the domain root, regardless of Vite's asset bundling
+ort.env.wasm.wasmPaths = window.location.origin + '/ort-wasm/';
 
 export class InferenceService {
     private session: ort.InferenceSession | null = null;
+    private dummySession: ort.InferenceSession | null = null;
+    private isInitialized = false;
 
+    async init() {
+        if (this.isInitialized) return;
 
-    /**
-     * Initializes the ORT Session with a dummy ONNX model for Track B.
-     * Prioritizes WebGPU but gracefully falls back to WASM for unsupported Android configurations.
-     */
-    async initializeSession(modelUrl: string): Promise<boolean> {
         try {
-            // Phase 0 Device constraint: Attempt WebGPU first
-            if (navigator.gpu) {
-                try {
-                    this.session = await ort.InferenceSession.create(modelUrl, { executionProviders: ['webgpu'] });
-                    console.log("✅ Track B: ORT Session created with WebGPU backend.");
-                    return true;
-                } catch (webgpuError) {
-                    console.warn("⚠️ WebGPU session creation failed, falling back to WASM", webgpuError);
+            // First, attempt to load a user-provided roboflow.onnx
+            const response = await fetch('/models/roboflow.onnx', { method: 'HEAD' });
+            if (response.ok) {
+                console.log("Loading custom Roboflow model: /models/roboflow.onnx");
+                this.session = await ort.InferenceSession.create('/models/roboflow.onnx', { executionProviders: ['wasm'] });
+            } else {
+                throw new Error("roboflow.onnx not found");
+            }
+        } catch (e) {
+            console.log("Falling back to default model: /models/best.onnx");
+            this.session = await ort.InferenceSession.create('/models/best.onnx', { executionProviders: ['wasm'] });
+        }
+
+        try {
+            this.dummySession = await ort.InferenceSession.create('/models/dummy.onnx', { executionProviders: ['wasm'] });
+        } catch (e) {
+            console.warn("Dummy session not loaded. Inference Track B will fail if called.");
+        }
+
+        this.isInitialized = true;
+        console.log("✅ Models loaded.");
+    }
+
+    private preprocess(canvas: HTMLCanvasElement): { tensor: ort.Tensor, scale: number, padX: number, padY: number } {
+        PillDetector.applyCLAHE(canvas);
+
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = 640;
+        tempCanvas.height = 640;
+        const tempCtx = tempCanvas.getContext('2d', { willReadFrequently: true });
+        if (!tempCtx) throw new Error("Could not get temp canvas context");
+
+        tempCtx.fillStyle = '#000000';
+        tempCtx.fillRect(0, 0, 640, 640);
+
+        const scale = Math.min(640 / canvas.width, 640 / canvas.height);
+        const scaledW = canvas.width * scale;
+        const scaledH = canvas.height * scale;
+        const padX = (640 - scaledW) / 2;
+        const padY = (640 - scaledH) / 2;
+
+        tempCtx.drawImage(canvas, 0, 0, canvas.width, canvas.height, padX, padY, scaledW, scaledH);
+
+        const imgData = tempCtx.getImageData(0, 0, 640, 640);
+        const data = imgData.data;
+
+        const float32Data = new Float32Array(3 * 640 * 640);
+        let offset = 0;
+        const c1 = 640 * 640;
+        const c2 = 2 * 640 * 640;
+
+        for (let i = 0; i < data.length; i += 4) {
+            float32Data[offset] = data[i] / 255.0;           // R
+            float32Data[c1 + offset] = data[i + 1] / 255.0;  // G
+            float32Data[c2 + offset] = data[i + 2] / 255.0;  // B
+            offset++;
+        }
+
+        return {
+            tensor: new ort.Tensor('float32', float32Data, [1, 3, 640, 640]),
+            scale, padX, padY
+        };
+    }
+
+    private postprocess(outputTensor: ort.Tensor, padX: number, padY: number, confThreshold: number = 0.08): { boxes: BoundingBox[], maxConf: number } {
+        const data = outputTensor.data as Float32Array;
+        const dims = outputTensor.dims;
+        let numPriors = 8400;
+        let featureDim = 6;
+        let isTranspose = false;
+        let batchOffset = 0;
+
+        if (dims.length === 3) {
+            // YOLOv8 typical shapes: [batch, 4 + classes, 8400] or [batch, 8400, 4 + classes]
+            if (dims[1] < dims[2]) {
+                // shape [batch, features, priors]
+                featureDim = dims[1];
+                numPriors = dims[2];
+                isTranspose = true;
+            } else {
+                // shape [batch, priors, features]
+                numPriors = dims[1];
+                featureDim = dims[2];
+                isTranspose = false;
+            }
+        } else if (dims.length === 2) {
+            numPriors = dims[0];
+            featureDim = dims[1];
+            isTranspose = false;
+        } else {
+            console.warn("Unexpected output tensor shape:", dims);
+            return { boxes: [], maxConf: 0 };
+        }
+
+        const numClasses = featureDim - 4;
+        if (numClasses <= 0) {
+            console.error("Invalid feature dimensions for YOLOv8.");
+            return { boxes: [], maxConf: 0 };
+        }
+
+        let boxes: BoundingBox[] = [];
+        let maxConf = 0;
+
+        const scaledW = 640 - 2 * padX;
+        const scaledH = 640 - 2 * padY;
+
+        for (let i = 0; i < numPriors; i++) {
+            let priorMaxConf = 0;
+            let bestClassId = 0;
+
+            for (let c = 0; c < numClasses; c++) {
+                const confIdx = isTranspose
+                    ? batchOffset + (4 + c) * numPriors + i
+                    : batchOffset + i * featureDim + (4 + c);
+
+                const cConf = data[confIdx];
+                if (cConf > priorMaxConf) {
+                    priorMaxConf = cConf;
+                    bestClassId = c;
                 }
             }
 
-            // Fallback
-            this.session = await ort.InferenceSession.create(modelUrl, { executionProviders: ['wasm'] });
-            console.log("✅ Track B: ORT Session created with WASM backend.");
-            return true;
+            if (priorMaxConf > maxConf) maxConf = priorMaxConf;
 
-        } catch (e) {
-            console.error("❌ Failed to initialize Track B ORT session", e);
-            return false;
+            if (priorMaxConf > confThreshold) {
+                // Parse Center X, Center Y, Width, Height using dynamic index mapping
+                const cx640 = isTranspose ? data[batchOffset + 0 * numPriors + i] : data[batchOffset + i * featureDim + 0];
+                const cy640 = isTranspose ? data[batchOffset + 1 * numPriors + i] : data[batchOffset + i * featureDim + 1];
+                const w640 = isTranspose ? data[batchOffset + 2 * numPriors + i] : data[batchOffset + i * featureDim + 2];
+                const h640 = isTranspose ? data[batchOffset + 3 * numPriors + i] : data[batchOffset + i * featureDim + 3];
+
+                const normX = (cx640 - padX) / scaledW;
+                const normY = (cy640 - padY) / scaledH;
+                const rawNormW = w640 / scaledW;
+                const rawNormH = h640 / scaledH;
+
+                // Shrink boxes by a factor to counteract model padding, improving NMS grouping
+                const normW = rawNormW * 0.55;
+                const normH = rawNormH * 0.55;
+
+                boxes.push({
+                    x: normX,
+                    y: normY,
+                    w: normW,
+                    h: normH,
+                    confidence: priorMaxConf,
+                    label: `pill_${bestClassId}`
+                });
+            }
         }
+
+        // Apply a relatively strict NMS (0.30) to prune out thick overlapping boxes typically caused by low confidence thresholding.
+        return { boxes: this.nms(boxes, 0.30), maxConf };
     }
 
-    /**
-     * TRACK A: Pure Stub Inference
-     * Used to quickly test the E2E state machine, UI, and SLA timing metrics
-     * without requiring an active ONNX model.
-     */
-    async runTrackAStub(expectedUniformCount: number): Promise<BatchProcessingResult> {
-        const startTime = performance.now();
+    private nms(boxes: BoundingBox[], iouThreshold: number): BoundingBox[] {
+        if (boxes.length === 0) return [];
+        boxes.sort((a, b) => b.confidence - a.confidence);
 
-        // Simulate some work taking roughly 150-250ms (average cheap WASM ONNX time)
-        await new Promise(resolve => setTimeout(resolve, 200));
+        const kept: BoundingBox[] = [];
+        for (const box of boxes) {
+            let keep = true;
+            for (const keptBox of kept) {
+                if (this.iou(box, keptBox) > iouThreshold) {
+                    keep = false;
+                    break;
+                }
+            }
+            if (keep) kept.push(box);
+        }
+        return kept;
+    }
 
-        const inferEnd = performance.now();
+    private iou(box1: BoundingBox, box2: BoundingBox): number {
+        const x1 = Math.max(box1.x - box1.w / 2, box2.x - box2.w / 2);
+        const y1 = Math.max(box1.y - box1.h / 2, box2.y - box2.h / 2);
+        const x2 = Math.min(box1.x + box1.w / 2, box2.x + box2.w / 2);
+        const y2 = Math.min(box1.y + box1.h / 2, box2.y + box2.h / 2);
 
-        // Stub: 10 valid bags of expected count, each with fake bounding boxes
-        const results = Array(10).fill(0).map((_, bagIdx) => {
-            const boxes = Array(expectedUniformCount).fill(0).map((_, pillIdx) => ({
-                // Simulate pills spread inside each bag region
-                x: (bagIdx * 0.1) + 0.02 + (pillIdx % 3) * 0.025 + Math.random() * 0.01,
-                y: 0.55 + (Math.floor(pillIdx / 3)) * 0.08 + Math.random() * 0.03,
-                w: 0.018 + Math.random() * 0.005,
-                h: 0.04 + Math.random() * 0.01,
-                confidence: 0.92 + Math.random() * 0.07,
-                label: ['pill', 'capsule', 'tablet'][Math.floor(Math.random() * 3)]
-            }));
+        const interArea = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+        if (interArea === 0) return 0;
+
+        const box1Area = box1.w * box1.h;
+        const box2Area = box2.w * box2.h;
+        return interArea / (box1Area + box2Area - interArea);
+    }
+
+    async runTrackBYolo(canvas: HTMLCanvasElement): Promise<BatchProcessingResult> {
+        if (!this.session) throw new Error("ONNX Session not initialized");
+
+        const startInfer = performance.now();
+
+        let tensor: ort.Tensor;
+        let padX: number, padY: number;
+        try {
+            const preProcessed = this.preprocess(canvas);
+            tensor = preProcessed.tensor;
+            padX = preProcessed.padX;
+            padY = preProcessed.padY;
+        } catch (e) {
+            console.error("Tensor preprocessing failed", e);
+            throw e;
+        }
+
+        const inputName = this.session.inputNames[0];
+        let rawResults: ort.InferenceSession.ReturnType;
+        try {
+            rawResults = await this.session.run({ [inputName]: tensor });
+        } catch (e: any) {
+            const errMsg = e.message || e.toString();
+            // Handle dynamically exported models that expect fixed batch dimensions (e.g., [8, 3, 640, 640])
+            const match = errMsg.match(/index: 0 Got: \d+ Expected: (\d+)/);
+            if (match) {
+                const requiredBatchSize = parseInt(match[1], 10);
+                console.log(`Model expects batch size ${requiredBatchSize}. Auto-padding tensor to fulfill requirement...`);
+
+                // Pad the existing tensor data with zeros up to the required batch size
+                const originalData = tensor.data as Float32Array;
+                const paddedData = new Float32Array(requiredBatchSize * 3 * 640 * 640);
+                paddedData.set(originalData);
+
+                tensor = new ort.Tensor('float32', paddedData, [requiredBatchSize, 3, 640, 640]);
+                rawResults = await this.session.run({ [inputName]: tensor });
+            } else {
+                console.error("ONNX Runtime session.run() failed", e);
+                throw e;
+            }
+        }
+
+        const outputName = this.session.outputNames[0];
+        const outputTensor = rawResults[outputName];
+
+        if (!outputTensor || !outputTensor.data) {
+            throw new Error(`Failed to extract valid ${outputName} tensor from ONNX results.`);
+        }
+
+        // Dynamically applying a balanced threshold (0.25) to accommodate both best.onnx (high conf) and roboflow.onnx (low conf output).
+        const { boxes, maxConf } = this.postprocess(outputTensor, padX, padY, 0.25);
+
+        const endInfer = performance.now();
+        const shapeStr = outputTensor.dims.join('x');
+        console.log(`✅ YOLOv8 detected ${boxes.length} pills in ${(endInfer - startInfer).toFixed(1)}ms. Shape: ${shapeStr}, MaxConf: ${maxConf.toFixed(3)}`);
+
+        const startPost = performance.now();
+
+        const bagClusters = PillDetector.clusterIntoBags(boxes);
+
+        const counts = bagClusters.map(c => c.length).filter(l => l > 0);
+        let expectedPerBag = 0;
+        if (counts.length > 0) {
+            const freq: Record<number, number> = {};
+            let maxFreq = 0, mode = counts[0];
+            counts.forEach(c => {
+                freq[c] = (freq[c] || 0) + 1;
+                if (freq[c] > maxFreq) { maxFreq = freq[c]; mode = c; }
+            });
+            expectedPerBag = mode;
+        }
+
+        const results = bagClusters.map(b => {
+            const avgConf = b.length > 0 ? b.reduce((s, box) => s + box.confidence, 0) / b.length : 0;
             return {
-                boxCount: expectedUniformCount,
-                confidenceAverage: 0.98,
-                passedExpectedCount: true,
-                boxes
+                boxCount: b.length,
+                confidenceAverage: avgConf,
+                passedExpectedCount: expectedPerBag > 0 && b.length === expectedPerBag,
+                boxes: b
             };
         });
 
-        // If uniform rule is enabled, assume all pass for Track A true
-        const overallPass = results.every(r => r.passedExpectedCount);
-
-        const renderEnd = performance.now();
+        const overallPass = expectedPerBag > 0 && results.every(r => r.passedExpectedCount);
+        const endPost = performance.now();
 
         const metrics: PipelineMetrics = {
-            captureMs: 0, // Injected by caller
-            warpMs: 0,    // Injected by caller
-            inferMs: inferEnd - startTime,
-            postprocessMs: 2,
-            renderMs: renderEnd - inferEnd,
-            totalMs: 0    // Handled by caller
+            captureMs: 0,
+            warpMs: 0,
+            inferMs: endInfer - startInfer,
+            postprocessMs: endPost - startPost,
+            renderMs: 0,
+            totalMs: 0,
+            debugStr: `[${shapeStr}] MaxConf:${maxConf.toFixed(3)}`
         };
 
-        return { results, metrics, overallPass };
+        return { results, metrics, overallPass, expectedPerBag };
     }
 
-    /**
-     * TRACK B: Real dummy ONNX execution.
-     * Demonstrates capability to process tensor data and output shapes to verify ORT WebGPU/WASM routing.
-     * Does NOT interpret the output as accurate pill counts for Phase 0.
-     */
     async runTrackBDummy(tensor: ort.Tensor): Promise<{ inferMs: number, shape: string }> {
-        if (!this.session) throw new Error("Session not initialized for Track B");
+        if (!this.dummySession) throw new Error("Session not initialized for Track B");
 
         const startTime = performance.now();
 
-        // Run inference (dummy model expects an input named 'images' typically, e.g. YOLO format)
-        // We try to grab the first input name from the session metadata
-        const inputName = this.session.inputNames[0];
+        const inputName = this.dummySession.inputNames[0];
         const feeds: Record<string, ort.Tensor> = {};
         feeds[inputName] = tensor;
 
-        const results = await this.session.run(feeds);
+        const results = await this.dummySession.run(feeds);
 
         const endTime = performance.now();
 
-        const outputName = this.session.outputNames[0];
+        const outputName = this.dummySession.outputNames[0];
         const outputTensor = results[outputName];
 
         console.log(`✅ Track B: Dummy Inference completed. Output shape: ${outputTensor.dims.join('x')}`);
@@ -117,5 +326,4 @@ export class InferenceService {
     }
 }
 
-// Singleton for app-wide use
 export const MvpInferenceService = new InferenceService();

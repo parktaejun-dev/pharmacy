@@ -5,6 +5,7 @@ export interface PipelineMetrics {
     postprocessMs: number;
     renderMs: number;
     totalMs: number;
+    debugStr?: string;
 }
 
 export interface BoundingBox {

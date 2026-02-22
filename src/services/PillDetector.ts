@@ -1,22 +1,15 @@
 import { BoundingBox } from './Metrics';
 
 /**
- * PillDetector v6 — HoughCircles only, no contours
+ * PillDetector v15 — Ultra-Aggressive Hybrid
  *
- * Contour-based detection creates too many false positives
- * (bag labels, text, edges) even with strict circularity.
- * HoughCircles specifically detects circular objects = pills.
- *
- * - Center ROI crop to exclude background
- * - Multi-pass HoughCircles with decreasing sensitivity
- * - Strict brightness filter (pills are bright)
- * - NMS deduplication across passes
+ * Pipeline:
+ * 1. Ultra-aggressive HoughCircles (param2 as low as 10) to find ALL possible pill candidates (including distorted/faint ones).
+ * 2. Strict HSV Color Mask limits candidates to ONLY pill-colored regions.
+ * 3. Text/noise found by Hough is purely rejected because its mask mean is 0.
+ * 4. Y-position filter removed because color mask handles text robustly.
  */
 export class PillDetector {
-
-    private static readonly ROI_MARGIN_X = 0.08;
-    private static readonly ROI_MARGIN_TOP = 0.10;
-    private static readonly ROI_MARGIN_BOTTOM = 0.05;
 
     static detectFromImage(imgElement: HTMLImageElement): BoundingBox[] {
         const cv = (window as any).cv;
@@ -32,6 +25,55 @@ export class PillDetector {
         finally { src.delete(); }
     }
 
+    /**
+     * Contrast Limited Adaptive Histogram Equalization (CLAHE)
+     * Removes monitor glare and normalizes exposure across the entire canvas.
+     * This mutates the provided canvas IN-PLACE to act as a preprocessor for YOLO inference.
+     */
+    static applyCLAHE(canvas: HTMLCanvasElement): void {
+        const cv = (window as any).cv;
+        if (!cv || !cv.Mat) return; // Fail gracefully if OpenCV not loaded
+
+        const src = cv.imread(canvas);
+        const lab = new cv.Mat();
+        const dest = new cv.Mat();
+
+        try {
+            // Convert to LAB color space to isolate Luminance (lightness)
+            cv.cvtColor(src, lab, cv.COLOR_RGBA2RGB); // First drop Alpha
+            cv.cvtColor(lab, lab, cv.COLOR_RGB2Lab);
+
+            // Split into L, A, B channels
+            const channels = new cv.MatVector();
+            cv.split(lab, channels);
+
+            const lChannel = channels.get(0);
+
+            // Apply CLAHE to the L-channel
+            const clahe = new cv.CLAHE(3.0, new cv.Size(8, 8)); // ClipLimit=3.0, TileGridSize=8x8
+            clahe.apply(lChannel, lChannel);
+
+            // Merge back and convert to RGBA
+            cv.merge(channels, lab);
+            cv.cvtColor(lab, dest, cv.COLOR_Lab2RGB);
+            cv.cvtColor(dest, dest, cv.COLOR_RGB2RGBA); // Restore Alpha for canvas compatibility
+
+            // Draw back onto the canvas
+            cv.imshow(canvas, dest);
+
+            // Cleanup local references inside the try block
+            lChannel.delete();
+            channels.delete();
+            clahe.delete();
+        } catch (e) {
+            console.error("OpenCV CLAHE application failed", e);
+        } finally {
+            src.delete();
+            lab.delete();
+            dest.delete();
+        }
+    }
+
     static detectFromCanvas(canvas: HTMLCanvasElement): BoundingBox[] {
         const cv = (window as any).cv;
         if (!cv || !cv.Mat) return [];
@@ -43,130 +85,152 @@ export class PillDetector {
     private static detect(cv: any, src: any): BoundingBox[] {
         const W = src.cols;
         const H = src.rows;
+        const minDim = Math.min(W, H);
 
-        // ROI crop — exclude background edges
-        const roiX = Math.round(W * this.ROI_MARGIN_X);
-        const roiY = Math.round(H * this.ROI_MARGIN_TOP);
-        const roiW = Math.round(W * (1 - 2 * this.ROI_MARGIN_X));
-        const roiH = Math.round(H * (1 - this.ROI_MARGIN_TOP - this.ROI_MARGIN_BOTTOM));
-        const roi = src.roi(new cv.Rect(roiX, roiY, roiW, roiH));
-
-        try {
-            const boxes = this.detectCircles(cv, roi, roiW, roiH);
-
-            // Convert coordinates back to full image space
-            const fullBoxes = boxes.map(box => ({
-                ...box,
-                x: (box.x * roiW + roiX) / W,
-                y: (box.y * roiH + roiY) / H,
-                w: (box.w * roiW) / W,
-                h: (box.h * roiH) / H,
-            }));
-
-            console.log(`🔍 ROI[${roiW}x${roiH}] → ${fullBoxes.length} pills detected`);
-            return fullBoxes;
-        } finally {
-            roi.delete();
-        }
-    }
-
-    /**
-     * Multi-pass HoughCircles with decreasing sensitivity
-     * Pass 1: strict (high confidence detections)
-     * Pass 2: moderate
-     * Pass 3: sensitive (catch remaining pills)
-     * All merged via NMS
-     */
-    private static detectCircles(cv: any, src: any, W: number, H: number): BoundingBox[] {
         const gray = new cv.Mat();
         const blurred = new cv.Mat();
+        const rgb = new cv.Mat();
         const hsv = new cv.Mat();
 
-        try {
-            cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+        cv.cvtColor(src, rgb, cv.COLOR_RGBA2RGB);
+        cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV);
+        rgb.delete();
 
-            // Strong blur to reduce screen moiré and noise
-            const ksize = Math.max(7, Math.round(Math.min(W, H) * 0.008) | 1);
-            cv.GaussianBlur(gray, blurred, new cv.Size(ksize, ksize), 2);
+        // 1. Generate exact Pill Color Mask
+        const mask = this.createPillMask(cv, hsv);
 
-            // HSV for color classification
-            const rgb = new cv.Mat();
-            cv.cvtColor(src, rgb, cv.COLOR_RGBA2RGB);
-            cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV);
-            rgb.delete();
+        // 2. Prepare for HoughCircles
+        // Moderate blur
+        const blurSize = Math.max(3, Math.round(minDim * 0.005) | 1); // ~5px for 640px
+        cv.GaussianBlur(gray, blurred, new cv.Size(blurSize, blurSize), 0, 0, cv.BORDER_DEFAULT);
 
-            const minDim = Math.min(W, H);
-            // Pills are substantial circles — at least 1.5% of min dimension
-            const minR = Math.max(8, Math.round(minDim * 0.018));
-            const maxR = Math.round(minDim * 0.065);
-            const minDist = Math.round(minR * 2.2);
+        // Allow smaller minimum radius to catch angled/squished pills
+        const minR = Math.max(7, Math.round(minDim * 0.010));  // ~6px for 640px
+        const maxR = Math.min(60, Math.round(minDim * 0.060)); // ~38px for 640px
+        const minDist = minR * 1.5; // Allow tight overlapping pills
 
-            const allBoxes: BoundingBox[] = [];
+        const boxes: BoundingBox[] = [];
+        let totalCircles = 0, rejColor = 0;
 
-            // Multi-pass with different accumulator thresholds
-            const passes = [
-                { param1: 80, param2: 35, confBonus: 0.15 },  // strict
-                { param1: 70, param2: 25, confBonus: 0.08 },  // moderate
-                { param1: 60, param2: 18, confBonus: 0.0 },   // sensitive
-            ];
+        // Multi-pass HoughCircles: from comfortable to ultra-aggressive
+        // Since we have the Color Mask, param2=10 is safe! It will find text/noise, but mask will reject them.
+        const passes = [
+            { p1: 65, p2: 18, baseConf: 0.85 },
+            { p1: 50, p2: 14, baseConf: 0.70 },
+            { p1: 40, p2: 10, baseConf: 0.55 } // Extremely sensitive pass
+        ];
 
-            for (const pass of passes) {
-                const circles = new cv.Mat();
-                cv.HoughCircles(blurred, circles, cv.HOUGH_GRADIENT,
-                    1, minDist, pass.param1, pass.param2, minR, maxR);
+        for (const pass of passes) {
+            const circles = new cv.Mat();
+            cv.HoughCircles(blurred, circles, cv.HOUGH_GRADIENT, 1, minDist, pass.p1, pass.p2, minR, maxR);
+            totalCircles += circles.cols;
 
-                for (let i = 0; i < circles.cols; i++) {
-                    const cx = circles.data32F[i * 3];
-                    const cy = circles.data32F[i * 3 + 1];
-                    const r = circles.data32F[i * 3 + 2];
+            for (let i = 0; i < circles.cols; i++) {
+                const cx = circles.data32F[i * 3];
+                const cy = circles.data32F[i * 3 + 1];
+                const r = circles.data32F[i * 3 + 2];
 
-                    // ROI for brightness check
-                    const rx = Math.max(0, Math.round(cx - r * 0.7));
-                    const ry = Math.max(0, Math.round(cy - r * 0.7));
-                    const rw = Math.min(Math.round(r * 1.4), W - rx);
-                    const rh = Math.min(Math.round(r * 1.4), H - ry);
-                    if (rw <= 0 || rh <= 0) continue;
+                // Note: No Y-position filter! We trust the color mask.
 
-                    // Brightness — pills should be notably bright
-                    const roiGray = gray.roi(new cv.Rect(rx, ry, rw, rh));
-                    const meanBright = cv.mean(roiGray);
-                    roiGray.delete();
-                    if (meanBright[0] < 130) continue;
+                // Sample the color mask around the center
+                // Sample a slightly larger ROI (5x5) to tolerate slight center shifts
+                const rx = Math.max(0, Math.round(cx - 2));
+                const ry = Math.max(0, Math.round(cy - 2));
+                const rw = Math.min(5, W - rx);
+                const rh = Math.min(5, H - ry);
+                if (rw <= 0 || rh <= 0) continue;
 
-                    // Color classification
-                    const roiHsv = hsv.roi(new cv.Rect(rx, ry, rw, rh));
-                    const cm = cv.mean(roiHsv);
-                    roiHsv.delete();
-                    const label = this.classifyColor(cm[0], cm[1]);
+                const maskRoi = mask.roi(new cv.Rect(rx, ry, rw, rh));
+                const maskMean = cv.mean(maskRoi)[0]; // 0 to 255
+                maskRoi.delete();
 
-                    const d = r * 2;
-                    const conf = Math.min(0.99, 0.72 + (meanBright[0] / 255) * 0.15 + pass.confBonus);
-
-                    allBoxes.push({
-                        x: cx / W, y: cy / H, w: d / W, h: d / H,
-                        confidence: conf, label
-                    });
+                // If the center is NOT predominantly a pill color, reject it!
+                // 128 means 50% of the center pixels must be pill-colored.
+                if (maskMean < 128) {
+                    rejColor++;
+                    continue;
                 }
-                circles.delete();
-            }
 
-            return this.nms(allBoxes, 0.3);
-        } finally {
-            gray.delete();
-            blurred.delete();
-            hsv.delete();
+                // Determine specific color label from HSV
+                const hsvRoi = hsv.roi(new cv.Rect(rx, ry, rw, rh));
+                const hsvMean = cv.mean(hsvRoi);
+                hsvRoi.delete();
+                const label = this.classifyColor(hsvMean[0], hsvMean[1]);
+
+                const d = r * 2;
+                // Add tiny bonus for strong color mask match
+                const conf = Math.min(0.99, pass.baseConf + (maskMean / 255) * 0.1);
+
+                boxes.push({
+                    x: cx / W, y: cy / H, w: d / W, h: d / H,
+                    confidence: conf, label
+                });
+            }
+            circles.delete();
         }
+
+        console.log(`🔍 [${W}x${H}] Hough found ${totalCircles} candidates → verified ${boxes.length} pills (rejColor=${rejColor})`);
+
+        gray.delete(); blurred.delete(); hsv.delete(); mask.delete();
+
+        // Strong NMS to clean up the ultra-aggressive detections
+        return this.nms(boxes, 0.25);
     }
 
-    /**
-     * Group pills into bags using gap-based x-coordinate clustering
-     */
+    private static createPillMask(cv: any, hsv: any): any {
+        const masks: any[] = [];
+
+        // Blue pills
+        const mBlue = new cv.Mat();
+        cv.inRange(hsv, new cv.Mat(1, 1, cv.CV_8UC3, [85, 30, 70, 0]),
+            new cv.Mat(1, 1, cv.CV_8UC3, [135, 255, 255, 0]), mBlue);
+        masks.push(mBlue);
+
+        // Yellow pills
+        const mYellow = new cv.Mat();
+        cv.inRange(hsv, new cv.Mat(1, 1, cv.CV_8UC3, [12, 35, 100, 0]),
+            new cv.Mat(1, 1, cv.CV_8UC3, [45, 255, 255, 0]), mYellow);
+        masks.push(mYellow);
+
+        // Pink/Red pills
+        const mPink1 = new cv.Mat();
+        cv.inRange(hsv, new cv.Mat(1, 1, cv.CV_8UC3, [0, 25, 80, 0]),
+            new cv.Mat(1, 1, cv.CV_8UC3, [15, 255, 255, 0]), mPink1);
+        const mPink2 = new cv.Mat();
+        cv.inRange(hsv, new cv.Mat(1, 1, cv.CV_8UC3, [165, 25, 80, 0]),
+            new cv.Mat(1, 1, cv.CV_8UC3, [180, 255, 255, 0]), mPink2);
+        cv.bitwise_or(mPink1, mPink2, mPink1);
+        masks.push(mPink1);
+        mPink2.delete();
+
+        // White pills (low sat, high value). Looser to handle shading under plastic.
+        const mWhite = new cv.Mat();
+        cv.inRange(hsv, new cv.Mat(1, 1, cv.CV_8UC3, [0, 0, 150, 0]),
+            new cv.Mat(1, 1, cv.CV_8UC3, [180, 55, 255, 0]), mWhite);
+        masks.push(mWhite);
+
+        // Combine
+        const combined = masks[0].clone();
+        for (let i = 1; i < masks.length; i++) cv.bitwise_or(combined, masks[i], combined);
+        masks.forEach(m => m.delete());
+
+        // Fill small holes in mask and expand so the Hough center definitely hits it
+        const kSize = 7;
+        const kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(kSize, kSize));
+        cv.morphologyEx(combined, combined, cv.MORPH_CLOSE, kernel);
+        cv.dilate(combined, combined, kernel); // Expand to catch slightly off-center detections
+        kernel.delete();
+
+        return combined;
+    }
+
     static clusterIntoBags(boxes: BoundingBox[]): BoundingBox[][] {
         if (boxes.length === 0) return [];
         const sorted = [...boxes].sort((a, b) => a.x - b.x);
         const avgWidth = sorted.reduce((s, b) => s + b.w, 0) / sorted.length;
-        // Gap = at least 2x pill width or 3% of image
-        const gapThreshold = Math.max(avgWidth * 2.0, 0.025);
+        // Gap threshold for separating bags (increased multiplier to compensate for bounding box shrinkage heuristics)
+        const gapThreshold = Math.max(avgWidth * 2.5, 0.035);
 
         const clusters: BoundingBox[][] = [[sorted[0]]];
         for (let i = 1; i < sorted.length; i++) {
@@ -179,14 +243,15 @@ export class PillDetector {
     }
 
     private static classifyColor(h: number, s: number): string {
-        if (s < 30) return '흰색';
-        if (h >= 90 && h <= 130) return '파란색';
-        if (h >= 15 && h <= 40) return '노란색';
-        if (h >= 0 && h <= 15) return '분홍색';
+        if (s < 55) return '흰색/투명';
+        if (h >= 85 && h <= 135) return '파란색';
+        if (h >= 12 && h <= 45) return '노란색';
+        if (h >= 0 && h <= 15 || h >= 165 && h <= 180) return '분홍색/적색';
         return '알약';
     }
 
     private static nms(boxes: BoundingBox[], threshold: number): BoundingBox[] {
+        if (boxes.length === 0) return [];
         const sorted = [...boxes].sort((a, b) => b.confidence - a.confidence);
         const kept: BoundingBox[] = [];
         for (const box of sorted) {
