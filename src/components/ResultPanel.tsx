@@ -90,7 +90,7 @@ export const ResultPanel: React.FC<ResultPanelProps> = ({ result, onRescan, expe
     const bgImage = imageUrl || '/testset/normal_5pills.png';
 
     return (
-        <div style={{ position: 'relative', width: '100%', height: '100%', background: '#000', overflow: 'hidden' }}>
+        <div style={{ position: 'absolute', inset: 0, background: '#000', overflow: 'hidden' }}>
 
             {/* Full-screen photo with bounding boxes */}
             <div ref={containerRef} style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>

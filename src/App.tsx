@@ -166,11 +166,9 @@ function App() {
         );
 
       case 'RESULT':
-        return (
-          <div className="viewport-wrapper" style={{ alignItems: 'stretch' }}>
-            {result && <ResultPanel result={result} expectedCount={EXPECTED_PILLS} imageUrl={capturedImageUrl || undefined} onRescan={() => setScanState('CAMERA')} />}
-          </div>
-        );
+        return result ? (
+          <ResultPanel result={result} expectedCount={EXPECTED_PILLS} imageUrl={capturedImageUrl || undefined} onRescan={() => setScanState('CAMERA')} />
+        ) : null;
 
       default:
         return null;
