@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import './index.css';
 import { DeviceHealthCheck } from './pages/DeviceHealthCheck';
 import { TestMode } from './pages/TestMode';
@@ -6,8 +6,24 @@ import { DataCollect } from './pages/DataCollect';
 import { CameraView, QualityMetrics } from './components/CameraView';
 import { ResultPanel } from './components/ResultPanel';
 import { ComputerVision } from './services/ComputerVision';
-import { MvpInferenceService } from './services/Inference';
-import { BatchProcessingResult, PipelineMetrics } from './services/Metrics';
+import { PillDetector } from './services/PillDetector';
+import { BatchProcessingResult, PipelineMetrics, InferenceResult, BoundingBox } from './services/Metrics';
+
+// Assign detected boxes to bag columns by x position
+function assignBoxesToBags(boxes: BoundingBox[], bagCount: number, expectedPerBag: number): InferenceResult[] {
+  const bagWidth = 1.0 / bagCount;
+  const bags: BoundingBox[][] = Array(bagCount).fill(null).map(() => []);
+  for (const box of boxes) {
+    const bagIdx = Math.min(bagCount - 1, Math.max(0, Math.floor(box.x / bagWidth)));
+    bags[bagIdx].push(box);
+  }
+  return bags.map(bagBoxes => ({
+    boxCount: bagBoxes.length,
+    confidenceAverage: bagBoxes.length > 0 ? bagBoxes.reduce((s, b) => s + b.confidence, 0) / bagBoxes.length : 0,
+    passedExpectedCount: bagBoxes.length === expectedPerBag,
+    boxes: bagBoxes
+  }));
+}
 
 type AppTab = '검수' | '테스트' | '데이터수집' | '진단';
 
@@ -20,11 +36,16 @@ const STATE_LABELS: Record<ScanState, string> = {
   RESULT: '결과',
 };
 
+const EXPECTED_PILLS = 10;
+const BAG_COUNT = 10;
+
 function App() {
   const [activeTab, setActiveTab] = useState<AppTab>('검수');
   const [scanState, setScanState] = useState<ScanState>('INIT');
   const [quality, setQuality] = useState<QualityMetrics>({ isStable: false, glareScore: 0, blurScore: 0 });
   const [result, setResult] = useState<BatchProcessingResult | null>(null);
+  const [capturedImageUrl, setCapturedImageUrl] = useState<string | null>(null);
+  const latestFrameCanvas = useRef<HTMLCanvasElement | null>(null);
 
   // Landscape lock
   useEffect(() => {
@@ -48,6 +69,8 @@ function App() {
   }, [scanState]);
 
   const handleFrameReady = useCallback((canvas: HTMLCanvasElement) => {
+    // Store latest frame for capture
+    latestFrameCanvas.current = canvas;
     if (scanState === 'CAMERA') {
       const q = ComputerVision.evaluateQualityGate(canvas);
       setQuality(q);
@@ -65,17 +88,42 @@ function App() {
   const executeScan = async () => {
     setScanState('SCANNING');
     const start = performance.now();
-    const inferenceResult = await MvpInferenceService.runTrackAStub(10);
-    const end = performance.now();
+
+    // Capture the current frame
+    const frameCanvas = latestFrameCanvas.current;
+    if (!frameCanvas) {
+      console.error('No frame canvas available');
+      setScanState('CAMERA');
+      return;
+    }
+
+    // Save captured image for display in results
+    const captureUrl = frameCanvas.toDataURL('image/jpeg', 0.85);
+    setCapturedImageUrl(captureUrl);
+    const captureEnd = performance.now();
+
+    // Run REAL OpenCV pill detection
+    const allBoxes = PillDetector.detectFromCanvas(frameCanvas);
+    const inferEnd = performance.now();
+
+    console.log(`🔍 Detected ${allBoxes.length} pills in ${(inferEnd - captureEnd).toFixed(0)}ms`);
+
+    // Assign boxes to bags by x position
+    const bagResults = assignBoxesToBags(allBoxes, BAG_COUNT, EXPECTED_PILLS);
+
+    const overallPass = bagResults.every(r => r.boxCount === EXPECTED_PILLS);
+    const renderEnd = performance.now();
 
     const metrics: PipelineMetrics = {
-      ...inferenceResult.metrics,
-      captureMs: 12.4,
-      warpMs: 18.2,
-      totalMs: end - start + 30.6
+      captureMs: captureEnd - start,
+      warpMs: 0,
+      inferMs: inferEnd - captureEnd,
+      postprocessMs: renderEnd - inferEnd,
+      renderMs: 1,
+      totalMs: renderEnd - start
     };
 
-    setResult({ ...inferenceResult, metrics });
+    setResult({ results: bagResults, metrics, overallPass });
     setScanState('RESULT');
   };
 
@@ -120,7 +168,7 @@ function App() {
       case 'RESULT':
         return (
           <div className="viewport-wrapper" style={{ alignItems: 'stretch' }}>
-            {result && <ResultPanel result={result} expectedCount={10} onRescan={() => setScanState('CAMERA')} />}
+            {result && <ResultPanel result={result} expectedCount={EXPECTED_PILLS} imageUrl={capturedImageUrl || undefined} onRescan={() => setScanState('CAMERA')} />}
           </div>
         );
 

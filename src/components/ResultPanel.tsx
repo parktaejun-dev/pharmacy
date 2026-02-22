@@ -5,6 +5,7 @@ interface ResultPanelProps {
     result: BatchProcessingResult;
     onRescan: () => void;
     expectedCount: number;
+    imageUrl?: string;  // captured frame or test image
 }
 
 // Draw bounding boxes on a canvas that auto-sizes to the image
@@ -71,7 +72,7 @@ const BBoxOverlay: React.FC<{ boxes: BoundingBox[], containerRef: React.RefObjec
     return <canvas ref={canvasRef} style={{ position: 'absolute', pointerEvents: 'none' }} />;
 };
 
-export const ResultPanel: React.FC<ResultPanelProps> = ({ result, onRescan, expectedCount }) => {
+export const ResultPanel: React.FC<ResultPanelProps> = ({ result, onRescan, expectedCount, imageUrl }) => {
     const allPass = result.results.every(r => r.boxCount === expectedCount);
     const failCount = result.results.filter(r => r.boxCount !== expectedCount).length;
     const [selectedBag, setSelectedBag] = useState<number | null>(null);
@@ -82,8 +83,8 @@ export const ResultPanel: React.FC<ResultPanelProps> = ({ result, onRescan, expe
         ? (result.results[selectedBag]?.boxes || [])
         : result.results.flatMap(r => r.boxes || []);
 
-    // Use test image as background (for demo)
-    const bgImage = allPass ? '/testset/normal_5pills.png' : '/testset/fail_missing_pills.png';
+    // Use provided image or fallback to test image
+    const bgImage = imageUrl || (allPass ? '/testset/normal_5pills.png' : '/testset/fail_missing_pills.png');
 
     return (
         <div className="result-container">
